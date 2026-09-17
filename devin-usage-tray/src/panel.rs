@@ -107,17 +107,18 @@ struct Charts {
     daily: Vec<(String, [f64; 4])>, // (MM-DD, [in, out, cr, cw])
 }
 
-fn load_charts() -> Charts {
+/// days=0 → 全部历史
+fn load_charts(days: i64) -> Charts {
     let mut c = Charts::default();
     let Some(conn) = open_db() else { return c };
-    let t14 = now() - 14 * 86400;
+    let t0 = if days > 0 { now() - days * 86400 } else { 0 };
     if let Ok(mut s) = conn.prepare(
         "SELECT strftime('%m-%d %H:%M', ts, 'unixepoch', 'localtime'),
                 weekly_quota_remaining_pct
          FROM quota_snapshots WHERE ts >= ?1 ORDER BY ts",
     ) {
         if let Ok(rows) =
-            s.query_map([t14], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+            s.query_map([t0], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
         {
             c.quota = rows.flatten().collect();
         }
@@ -128,7 +129,7 @@ fn load_charts() -> Charts {
                 sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
          FROM local_sessions WHERE created_at >= ?1 GROUP BY 1 ORDER BY 1",
     ) {
-        if let Ok(rows) = s.query_map([t14], |r| {
+        if let Ok(rows) = s.query_map([t0], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 [
@@ -145,11 +146,24 @@ fn load_charts() -> Charts {
     c
 }
 
+/// 中文量级：572.7M→5.7亿，3.5M→350万，更直观（面板专用，托盘/报告仍用 M/k）
+fn tok_zh(v: i64) -> String {
+    let v = v as f64;
+    if v.abs() >= 1e8 {
+        format!("{:.2}亿", v / 1e8)
+    } else if v.abs() >= 1e4 {
+        format!("{:.1}万", v / 1e4)
+    } else {
+        format!("{}", v as i64)
+    }
+}
+
 // ---------------------------------------------------------------- 面板
 
 struct Panel {
     st: Stats,
     charts: Charts,
+    days: i64, // 图表回看范围：7/14/30/90，0=全部
     report: String,
     logo: Option<egui::TextureHandle>,
     reloaded: Instant,
@@ -172,7 +186,8 @@ impl Panel {
         let report = build_report(&st);
         Self {
             st,
-            charts: load_charts(),
+            charts: load_charts(14),
+            days: 14,
             report,
             logo: None,
             reloaded: Instant::now(),
@@ -261,10 +276,17 @@ impl Panel {
                 )
             })
             .collect();
+        let labels_h = labels.clone();
         Plot::new("daily")
             .height(110.0)
             .x_axis_formatter(Self::x_fmt(&labels, 7))
             .y_axis_formatter(|m, _| format!("{:.0}M", m.value))
+            .label_formatter(move |name, p| {
+                // 悬停显示当日各构成（堆叠后 p.y 是累计顶，用天标签索引原值）
+                let i = p.x.round() as usize;
+                let day = labels_h.get(i).cloned().unwrap_or_default();
+                format!("{day} · {name}")
+            })
             .legend(Legend::default())
             .show(ui, |pui| {
                 for c in charts {
@@ -321,8 +343,12 @@ impl Panel {
                     ui.allocate_exact_size(egui::vec2(8.0_f32, 8.0_f32), egui::Sense::hover());
                 ui.painter().rect_filled(r, 2.0, *c);
                 ui.label(
-                    egui::RichText::new(format!("{name} {:.0}%", *v as f64 / total * 100.0))
-                        .small(),
+                    egui::RichText::new(format!(
+                        "{name} {} ({:.0}%)",
+                        tok_zh(*v),
+                        *v as f64 / total * 100.0
+                    ))
+                    .small(),
                 );
             }
         });
@@ -377,7 +403,7 @@ impl Panel {
                     ui.label(format!("{}{}", name, src));
                     ui.monospace(format!("{}", f.sessions));
                     ui.monospace(format!("{}", f.msgs));
-                    ui.monospace(tok(f.tout));
+                    ui.monospace(tok_zh(f.tout));
                     ui.monospace(format!("${:.2}", f.usd));
                     ui.end_row();
                 }
@@ -397,7 +423,7 @@ impl eframe::App for Panel {
                 .is_some_and(|t| t.elapsed() >= COLLECT_DELAY);
         if due {
             self.st = load_stats();
-            self.charts = load_charts();
+            self.charts = load_charts(self.days);
             self.report = build_report(&self.st);
             self.reloaded = Instant::now();
             self.collecting = None;
@@ -518,18 +544,54 @@ impl eframe::App for Panel {
                     ui.add_space(6.0);
                 }
 
-                // ---- 趋势卡片
+                // ---- 趋势卡片（含历史回看选择器）
                 card(ui, |ui| {
-                    ui.label(egui::RichText::new("配额趋势").strong());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("趋势").strong());
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                for (label, d) in [
+                                    ("全部", 0i64),
+                                    ("90天", 90),
+                                    ("30天", 30),
+                                    ("14天", 14),
+                                    ("7天", 7),
+                                ] {
+                                    if ui
+                                        .selectable_label(self.days == d, label)
+                                        .clicked()
+                                        && self.days != d
+                                    {
+                                        self.days = d;
+                                        self.charts = load_charts(d);
+                                    }
+                                }
+                            },
+                        );
+                    });
+                    ui.label(egui::RichText::new("配额剩余 %").small().weak());
                     self.quota_plot(ui);
                     if self.charts.quota.len() < 2 {
-                        ui.label(egui::RichText::new("快照积累中（每 15min 一条）").weak().small());
+                        ui.label(
+                            egui::RichText::new("快照积累中（每 15min 一条）").weak().small(),
+                        );
                     }
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new("每日 token（M）").strong());
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("每日 token（M）· 悬停看明细").small().weak(),
+                    );
                     self.daily_plot(ui);
                     if self.charts.daily.is_empty() {
                         ui.label(egui::RichText::new("暂无记录").weak().small());
+                    } else {
+                        ui.label(
+                            egui::RichText::new(
+                                "缓存读占大头是常态：KV cache 命中，不等于消耗配额",
+                            )
+                            .weak()
+                            .small(),
+                        );
                     }
                 });
                 ui.add_space(6.0);
@@ -552,8 +614,8 @@ impl eframe::App for Panel {
                                 ui.monospace(format!("{}", a.sessions));
                                 ui.monospace(format!("{}", a.msgs));
                                 ui.monospace(format!("{}", a.tools));
-                                ui.monospace(tok(a.tout));
-                                ui.monospace(tok(a.tcr));
+                                ui.monospace(tok_zh(a.tout));
+                                ui.monospace(tok_zh(a.tcr));
                                 ui.end_row();
                             }
                         });
@@ -562,14 +624,42 @@ impl eframe::App for Panel {
 
                 // ---- Token 构成卡片
                 card(ui, |ui| {
-                    ui.label(egui::RichText::new("Token 构成（累计）").strong());
+                    let t = &self.st.total_all;
+                    let sum = t.tin + t.tout + t.tcr + t.tcw;
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Token 构成").strong());
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("累计 {}", tok_zh(sum)))
+                                        .strong(),
+                                );
+                            },
+                        );
+                    });
                     self.mix_strip(ui);
                 });
                 ui.add_space(6.0);
 
                 // ---- 模型族卡片
                 card(ui, |ui| {
-                    ui.label(egui::RichText::new("模型族（全部模型）").strong());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("模型族（全部模型）").strong());
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "共 {} 个模型",
+                                        self.st.all_models.len()
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            },
+                        );
+                    });
                     self.model_table(ui);
                 });
                 ui.add_space(6.0);

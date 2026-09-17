@@ -310,7 +310,7 @@ pub fn load_stats() -> Stats {
     if let Ok(mut stmt) = conn.prepare(&format!(
         "{SELSM} GROUP BY source, model
          ORDER BY sum(ifnull(tok_in,0)+ifnull(tok_out,0)+ifnull(tok_cache_read,0)+ifnull(tok_cache_write,0)) DESC
-         LIMIT 40"
+         LIMIT 200"
     )) {
         if let Ok(rows) = stmt.query_map([], |r| {
             Ok((
