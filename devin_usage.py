@@ -7,7 +7,7 @@
               → 周配额剩余%、超额余额(micros USD)、plan 周期、配额重置时间、模型 creditMultiplier
   2. cloud    GET  https://api.devin.ai/v3/organizations/{org}/sessions
               Bearer devin-session-token → 云端会话 + acus_consumed
-  3. local    %APPDATA%/Devin/cli/sessions.db（只读打开）
+  3. local    cli/sessions.db（只读打开；Win %APPDATA%/Devin/cli，mac/Linux ~/.local/share/devin/cli）
               → 本地会话(App+CLI)：模型/mode/cwd/起止/标题/消息数/工具调用数
               metadata.client_meta["cognition.ai/requestingTabId"] 存在 → App 会话，否则 CLI
 
@@ -42,15 +42,26 @@ DATA_DIR = HERE / "data"
 DB_PATH = DATA_DIR / "usage.db"
 
 IS_MAC = sys.platform == "darwin"
+IS_WIN = sys.platform == "win32"
 if IS_MAC:
     DEVIN_DIR = Path.home() / "Library/Application Support/Devin"
     CLI_DIR = Path.home() / ".local/share/devin/cli"
-else:
+elif IS_WIN:
     APPDATA = Path(os.environ.get("APPDATA", str(Path.home() / "AppData/Roaming")))
     DEVIN_DIR = APPDATA / "Devin"
     CLI_DIR = DEVIN_DIR / "cli"
+else:  # Linux：CLI-only，凭证分散在 XDG data 与 XDG config
+    XDG_DATA = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))
+    XDG_CONF = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    DEVIN_DIR = XDG_DATA / "devin"
+    CLI_DIR = DEVIN_DIR / "cli"
+    LINUX_DIRS = [DEVIN_DIR, XDG_CONF / "devin"]
 CRED_FILES = [DEVIN_DIR / "credentials.toml", CLI_DIR / "credentials.toml"]
-CONFIG_FILE = DEVIN_DIR / "config.json"
+if not IS_WIN and not IS_MAC:
+    CRED_FILES = [d / "credentials.toml" for d in LINUX_DIRS] + CRED_FILES
+    CONFIG_FILES = [d / "config.json" for d in LINUX_DIRS]
+else:
+    CONFIG_FILES = [DEVIN_DIR / "config.json"]
 LOCAL_DB = CLI_DIR / "sessions.db"
 TOKEN_FILE = DATA_DIR / "devin-token.txt"   # 无 credentials 时的手动 token 兜底
 
@@ -82,10 +93,11 @@ def read_token() -> str:
 
 
 def read_org(token=None) -> "str | None":
-    try:
-        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))["devin"]["org_id"]
-    except Exception:
-        pass
+    for p in CONFIG_FILES:
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))["devin"]["org_id"]
+        except Exception:
+            continue
     if token:  # Mac 无 config.json → 用 /v3/self 发现
         try:
             req = urllib.request.Request(f"{DEVIN_API}/v3/self",

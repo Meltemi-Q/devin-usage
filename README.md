@@ -3,7 +3,21 @@
 Devin App / CLI / Cloud 的本地用量统计 + 系统托盘工具。
 
 逆向自 Devin Desktop 的真实数据面：**配额余额、云端 ACU、本地每个会话的真实
-token（输入/输出/缓存读/缓存写）、按模型等效美元折算**。Windows + macOS。
+token（输入/输出/缓存读/缓存写）、按模型等效美元折算**。
+Windows + macOS + Linux（含无头 VPS）。
+
+## 一键安装
+
+| 平台 | 命令 | 装了什么 |
+|---|---|---|
+| Windows | `powershell -File install-task.ps1` | 15 分钟定时采集（任务计划）+ 托盘开机自启 |
+| macOS | `bash install-agent-macos.sh` | 15 分钟定时采集（crontab）+ 托盘常驻（launchd，RunAtLoad+KeepAlive） |
+| Linux/VPS | `bash install-agent-linux.sh` | 15 分钟定时采集（crontab）；无 GUI 不装托盘 |
+
+卸载：各脚本加 `--uninstall` / `-Uninstall` 参数。
+
+前置要求：Python 3（仅标准库）；托盘需要 Rust 工具链构建
+（`cd devin-usage-tray && cargo build --release`），不构建则只装采集。
 
 ## 功能
 
@@ -18,7 +32,7 @@ token（输入/输出/缓存读/缓存写）、按模型等效美元折算**。W
 |---|---|---|
 | 配额 | `POST server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus`（Connect JSON，apiKey 在 body.metadata，无 Auth header） | 周配额剩余%、日/周重置时间、超额余额 USD、plan 周期、全部模型的 creditMultiplier |
 | 云端 | `GET api.devin.ai/v3/organizations/{org}/sessions`（Bearer session token） | 云端会话列表 + `acus_consumed`、状态、PR 数 |
-| 本地 | `sessions.db`（只读）：Win `%APPDATA%/Devin/cli/` · macOS `~/.local/share/devin/cli/` | 全部本地会话：模型/mode/cwd/起止/消息数/工具调用数；`requestingTabId` 区分 App/CLI；每条 assistant 消息 `metadata.metrics` 含真实 token + ttft/tpot |
+| 本地 | `sessions.db`（只读）：Win `%APPDATA%/Devin/cli/` · macOS/Linux `~/.local/share/devin/cli/` | 全部本地会话：模型/mode/cwd/起止/消息数/工具调用数；`requestingTabId` 区分 App/CLI；每条 assistant 消息 `metadata.metrics` 含真实 token + ttft/tpot |
 
 **token 用量**：`message_nodes.chat_message.metadata.metrics` 持久化了每次响应的
 `input_tokens`/`output_tokens`/`cache_read_tokens`/`cache_creation_tokens`，
@@ -72,30 +86,23 @@ exe 从 `target/release/` 向上自动定位 `devin_usage.py`/`data/usage.db`。
 
 `--dump-icon` 可导出 4 种状态图标 PNG 预览。
 
-## 定时采集
+## 平台差异备忘
 
-**Windows**（任务计划，每 15 分钟）：
-
-```powershell
-powershell -File install-task.ps1            # 安装
-powershell -File install-task.ps1 -Uninstall # 卸载
-```
-
-**macOS**（launchd 托盘常驻 + crontab 每 15 分钟）：
-
-```bash
-bash install-agent-macos.sh              # 安装
-bash install-agent-macos.sh --uninstall  # 卸载
-```
-
-## 平台差异备忘（macOS）
-
+**macOS**
 - Devin 数据目录 `~/Library/Application Support/Devin`；CLI 会话库在
   `~/.local/share/devin/cli/sessions.db`
 - 无 `config.json` → org_id 由 `GET /v3/self` 自动发现
 - token 顺序：`credentials.toml` → `data/devin-token.txt`。Mac 上没登录过 CLI
   时放一份 token 到 token.txt 即可；正式做法是在 Mac 跑一次 `devin auth login`。
   （macOS 钥匙串 OSCrypt 解密需要 GUI 会话，SSH 里拿不到）
+
+**Linux / 无头 VPS**
+- 只需 `devin` CLI 登录过一次（`devin auth login`），凭证在
+  `~/.local/share/devin/credentials.toml` 或 `~/.config/devin/credentials.toml`，
+  两处都会自动探测
+- CLI 会话库同样在 `~/.local/share/devin/cli/sessions.db`
+- 无托盘（无 GUI）；用 `report`/`watch`/`sessions` 子命令查看，
+  或把 `data/usage.db` 拉回有托盘的机器看
 
 ## 失效时的维护点
 
