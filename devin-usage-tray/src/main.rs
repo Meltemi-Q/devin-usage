@@ -302,12 +302,13 @@ pub fn load_stats() -> Stats {
 
 // ---------------------------------------------------------------- 图标
 
-const LOGO_PNG: &[u8] = include_bytes!("../assets/devin-logo.png");
+const LOGO_PNG: &[u8] = include_bytes!("../assets/devin-logo-1024.png");
 
-/// 32x32 托盘图标像素：白底圆角卡片 + Devin 黑色标志 + 右下配额状态点装饰
-/// quota_pct: 周配额剩余 %（None→灰点）
-pub fn paint_icon(quota_pct: Option<f64>) -> Vec<u8> {
-    let (w, h) = (32usize, 32usize);
+/// 托盘图标像素（size×size，Retina 建议 64）：白底圆角卡片 + Devin 黑色标志
+/// + 右下配额状态点装饰。quota_pct: 周配额剩余 %（None→灰点）
+pub fn paint_icon(quota_pct: Option<f64>, size: usize) -> Vec<u8> {
+    let (w, h) = (size, size);
+    let s = size as f32 / 32.0; // 相对 32px 设计稿的缩放
     let mut px = vec![0u8; w * h * 4];
     let put = |px: &mut [u8], x: i32, y: i32, c: [u8; 4]| {
         if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
@@ -322,28 +323,32 @@ pub fn paint_icon(quota_pct: Option<f64>) -> Vec<u8> {
         }
     };
     // 白底圆角卡片
+    let cr = (6.0 * s).round() as i32;       // 圆角半径
+    let shade_y = (26.0 * s).round() as i32; // 底部微阴影分界
     for y in 0..h as i32 {
         for x in 0..w as i32 {
             let (dx, dy) = (
-                if x < 6 { 6 - x } else { (x - 25).max(0) },
-                if y < 6 { 6 - y } else { (y - 25).max(0) },
+                if x < cr { cr - x } else { (x - (w as i32 - 1 - cr)).max(0) },
+                if y < cr { cr - y } else { (y - (h as i32 - 1 - cr)).max(0) },
             );
-            if dx * dx + dy * dy <= 36 {
-                let shade = if y > 26 { 232 } else { 245 }; // 底部微阴影
+            if dx * dx + dy * dy <= cr * cr {
+                let shade = if y > shade_y { 232 } else { 245 };
                 put(&mut px, x, y, [shade, shade, shade + 3, 255]);
             }
         }
     }
-    // Devin logo 缩到 26x26 居中贴上
+    // Devin logo 缩放到 26s×26s 居中贴上
+    let ls = (26.0 * s).round() as u32;
+    let off = ((size as u32 - ls) / 2) as i32;
     if let Ok(img) = image::load_from_memory(LOGO_PNG) {
         let logo = image::imageops::resize(
             &img.to_rgba8(),
-            26,
-            26,
+            ls,
+            ls,
             image::imageops::FilterType::Lanczos3,
         );
         for (lx, ly, p) in logo.enumerate_pixels() {
-            let (x, y) = (lx as i32 + 3, ly as i32 + 3);
+            let (x, y) = (lx as i32 + off, ly as i32 + off);
             if p[3] > 0 {
                 put(&mut px, x, y, [p[0], p[1], p[2], p[3]]);
             }
@@ -356,14 +361,15 @@ pub fn paint_icon(quota_pct: Option<f64>) -> Vec<u8> {
         Some(p) if p >= 20.0 => [255, 190, 90, 255],  // 琥珀
         Some(_) => [255, 90, 90, 255],                // 红
     };
-    let (cx, cy, r) = (24i32, 24i32, 6i32);
-    for y in (cy - r - 2)..=(cy + r + 2) {
-        for x in (cx - r - 2)..=(cx + r + 2) {
+    let (cx, cy, r) = ((24.0 * s) as i32, (24.0 * s) as i32, (6.0 * s) as i32);
+    let bw = (2.0 * s).max(1.0) as i32; // 描边宽
+    for y in (cy - r - bw)..=(cy + r + bw) {
+        for x in (cx - r - bw)..=(cx + r + bw) {
             let d2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
             if d2 <= r * r {
                 put(&mut px, x, y, dot);
-            } else if d2 <= (r + 2) * (r + 2) {
-                put(&mut px, x, y, [255, 255, 255, 255]); // 白描边
+            } else if d2 <= (r + bw) * (r + bw) {
+                put(&mut px, x, y, [255, 255, 255, 255]);
             }
         }
     }
@@ -371,7 +377,8 @@ pub fn paint_icon(quota_pct: Option<f64>) -> Vec<u8> {
 }
 
 pub fn make_icon(quota_pct: Option<f64>) -> Icon {
-    Icon::from_rgba(paint_icon(quota_pct), 32, 32).expect("icon")
+    let px = paint_icon(quota_pct, 64); // 64px：Retina @2x 清晰
+    Icon::from_rgba(px, 64, 64).expect("icon")
 }
 
 // ---------------------------------------------------------------- UI
@@ -626,9 +633,9 @@ fn main() {
     if args.iter().any(|a| a == "--dump-icon") {
         for (name, pct) in [("icon-green", Some(75.0)), ("icon-amber", Some(30.0)),
                             ("icon-red", Some(5.0)), ("icon-gray", None)] {
-            let px = paint_icon(pct);
+            let px = paint_icon(pct, 64);
             image::save_buffer(
-                format!("{name}.png"), &px, 32, 32, image::ColorType::Rgba8,
+                format!("{name}.png"), &px, 64, 64, image::ColorType::Rgba8,
             )
             .unwrap();
         }

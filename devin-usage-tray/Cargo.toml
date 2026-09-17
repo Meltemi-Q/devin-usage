@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 arboard = "3.6.1"
 eframe = "0.32"
+egui_plot = "0.33"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 tray-icon = "0.25.1"
