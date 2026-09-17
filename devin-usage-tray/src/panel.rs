@@ -101,10 +101,16 @@ fn family_of(m: &str) -> String {
 
 // ---------------------------------------------------------------- 图表数据
 
+struct DayRow {
+    ymd: String,   // 2026-09-17（查明细用）
+    label: String, // 09-17（轴标签用）
+    vals: [f64; 4], // [in, out, cr, cw]
+}
+
 #[derive(Default)]
 struct Charts {
-    quota: Vec<(String, f64)>,      // (MM-DD HH:MM, 剩余%)
-    daily: Vec<(String, [f64; 4])>, // (MM-DD, [in, out, cr, cw])
+    quota: Vec<(String, f64)>, // (MM-DD HH:MM, 剩余%)
+    daily: Vec<DayRow>,
 }
 
 /// days=0 → 全部历史
@@ -125,25 +131,62 @@ fn load_charts(days: i64) -> Charts {
     }
     // 各列分开 sum：整行相加遇 NULL 会整行变 NULL（老会话无 metrics）
     if let Ok(mut s) = conn.prepare(
-        "SELECT strftime('%m-%d', created_at, 'unixepoch', 'localtime'),
+        "SELECT strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime'),
+                strftime('%m-%d', created_at, 'unixepoch', 'localtime'),
                 sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
          FROM local_sessions WHERE created_at >= ?1 GROUP BY 1 ORDER BY 1",
     ) {
         if let Ok(rows) = s.query_map([t0], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                [
-                    r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+            Ok(DayRow {
+                ymd: r.get::<_, String>(0)?,
+                label: r.get::<_, String>(1)?,
+                vals: [
                     r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
                     r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
                     r.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                    r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
                 ],
-            ))
+            })
         }) {
             c.daily = rows.flatten().collect();
         }
     }
     c
+}
+
+/// 某一天的明细：该日总会话数 + 分模型行（token 降序）
+fn load_day_detail(ymd: &str) -> (i64, Vec<(String, i64, i64, i64, i64, i64)>) {
+    let mut n_sess = 0i64;
+    let mut rows = Vec::new();
+    let Some(conn) = open_db() else {
+        return (0, rows);
+    };
+    if let Ok(mut s) = conn.prepare(
+        "SELECT model, count(*), sum(n_user),
+                sum(tok_in), sum(tok_out), sum(tok_cache_read)
+         FROM local_sessions
+         WHERE strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') = ?1
+         GROUP BY model
+         ORDER BY ifnull(sum(tok_in),0)+ifnull(sum(tok_out),0)
+                  +ifnull(sum(tok_cache_read),0)+ifnull(sum(tok_cache_write),0) DESC",
+    ) {
+        if let Ok(it) = s.query_map([ymd], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+            ))
+        }) {
+            for row in it.flatten() {
+                n_sess += row.1;
+                rows.push(row);
+            }
+        }
+    }
+    (n_sess, rows)
 }
 
 /// 中文量级：572.7M→5.7亿，3.5M→350万，更直观（面板专用，托盘/报告仍用 M/k）
@@ -166,6 +209,7 @@ struct Panel {
     days: i64, // 图表回看范围：7/14/30/90，0=全部
     report: String,
     logo: Option<egui::TextureHandle>,
+    sel_day: Option<String>, // 图表中选中的日期（点柱子/下拉）
     reloaded: Instant,
     collecting: Option<Instant>,
     on_top: bool,
@@ -190,6 +234,7 @@ impl Panel {
             days: 14,
             report,
             logo: None,
+            sel_day: None,
             reloaded: Instant::now(),
             collecting: None,
             on_top: false,
@@ -242,12 +287,13 @@ impl Panel {
             });
     }
 
-    /// 每日 token 堆叠柱状图（按 in/out/缓存读/缓存写 分色，单位 M）
-    fn daily_plot(&self, ui: &mut egui::Ui) {
+    /// 每日 token 堆叠柱状图（按 in/out/缓存读/缓存写 分色，单位 M；点柱子选日期）
+    fn daily_plot(&mut self, ui: &mut egui::Ui) {
         if self.charts.daily.is_empty() {
             return;
         }
-        let labels: Vec<String> = self.charts.daily.iter().map(|(l, _)| l.clone()).collect();
+        let labels: Vec<String> =
+            self.charts.daily.iter().map(|d| d.label.clone()).collect();
         let series: [(&str, usize, egui::Color32); 4] = [
             ("输入", 0, C_IN),
             ("输出", 1, C_OUT),
@@ -264,9 +310,9 @@ impl Panel {
                         .daily
                         .iter()
                         .enumerate()
-                        .map(|(i, (_, v))| {
-                            let off: f64 = (0..*idx).map(|j| v[j] / 1e6).sum();
-                            let mut b = Bar::new(i as f64, v[*idx] / 1e6)
+                        .map(|(i, d)| {
+                            let off: f64 = (0..*idx).map(|j| d.vals[j] / 1e6).sum();
+                            let mut b = Bar::new(i as f64, d.vals[*idx] / 1e6)
                                 .width(0.6)
                                 .fill(*color);
                             b.base_offset = Some(off);
@@ -276,21 +322,84 @@ impl Panel {
                 )
             })
             .collect();
-        let labels_h = labels.clone();
-        Plot::new("daily")
+        let meta: Vec<(String, [f64; 4])> = self
+            .charts
+            .daily
+            .iter()
+            .map(|d| (d.label.clone(), d.vals))
+            .collect();
+        let presp = Plot::new("daily")
             .height(110.0)
+            .include_y(0.0)
             .x_axis_formatter(Self::x_fmt(&labels, 7))
             .y_axis_formatter(|m, _| format!("{:.0}M", m.value))
             .label_formatter(move |name, p| {
-                // 悬停显示当日各构成（堆叠后 p.y 是累计顶，用天标签索引原值）
                 let i = p.x.round() as usize;
-                let day = labels_h.get(i).cloned().unwrap_or_default();
-                format!("{day} · {name}")
+                if let Some((day, v)) = meta.get(i) {
+                    let idx = ["输入", "输出", "缓存读", "缓存写"]
+                        .iter()
+                        .position(|n| *n == name)
+                        .unwrap_or(0);
+                    let tot: f64 = v.iter().sum();
+                    format!("{day} {name} {:.2}M / 合计 {:.2}M", v[idx] / 1e6, tot / 1e6)
+                } else {
+                    format!("{name} {:.2}M", p.y)
+                }
             })
             .legend(Legend::default())
             .show(ui, |pui| {
                 for c in charts {
                     pui.bar_chart(c);
+                }
+            });
+        // 点击柱子 → 选中/取消该天，下方出明细
+        if presp.response.clicked() {
+            if let Some(pos) = presp.response.interact_pointer_pos() {
+                let p = presp.transform.value_from_position(pos);
+                let i = p.x.round() as usize;
+                if let Some(d) = self.charts.daily.get(i) {
+                    let ymd = d.ymd.clone();
+                    self.sel_day = if self.sel_day.as_deref() == Some(ymd.as_str()) {
+                        None
+                    } else {
+                        Some(ymd)
+                    };
+                }
+            }
+        }
+    }
+
+    /// 选中某天的明细块（分模型）
+    fn day_detail(&self, ui: &mut egui::Ui) {
+        let Some(ymd) = &self.sel_day else { return };
+        let (n_sess, rows) = load_day_detail(ymd);
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!("{} · {} 个会话", ymd, n_sess)).strong(),
+        );
+        if rows.is_empty() {
+            ui.label(egui::RichText::new("当日无会话").weak().small());
+            return;
+        }
+        egui::Grid::new("daydetail")
+            .num_columns(6)
+            .spacing([10.0, 3.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for h in ["模型", "会话", "msg", "输入", "输出", "缓存读"] {
+                    ui.label(egui::RichText::new(h).weak().small());
+                }
+                ui.end_row();
+                for (m, s, nmsg, tin, tout, tcr) in &rows {
+                    ui.label(egui::RichText::new(m).small());
+                    ui.monospace(format!("{s}"));
+                    ui.monospace(format!("{nmsg}"));
+                    ui.monospace(tok_zh(*tin));
+                    ui.monospace(tok_zh(*tout));
+                    ui.monospace(tok_zh(*tcr));
+                    ui.end_row();
                 }
             });
     }
@@ -354,63 +463,83 @@ impl Panel {
         });
     }
 
-    /// 模型族汇总表（全模型，不限 swe-2；按等效$降序，最多 10 族 + 其他）
+    /// 模型族汇总表（全部族）+ 可折叠的具体模型明细（50 个变体全列）
     fn model_table(&self, ui: &mut egui::Ui) {
         struct Fam {
             sessions: i64,
-            msgs: i64,
+            tin: i64,
             tout: i64,
+            tcr: i64,
             usd: f64,
             hours: f64,
-            sources: Vec<String>,
         }
         let mut fams: BTreeMap<String, Fam> = BTreeMap::new();
         for m in &self.st.all_models {
             let f = fams.entry(family_of(&m.model)).or_insert(Fam {
                 sessions: 0,
-                msgs: 0,
+                tin: 0,
                 tout: 0,
+                tcr: 0,
                 usd: 0.0,
                 hours: 0.0,
-                sources: vec![],
             });
             f.sessions += m.all.sessions;
-            f.msgs += m.all.msgs;
+            f.tin += m.all.tin;
             f.tout += m.all.tout;
+            f.tcr += m.all.tcr;
             f.usd += m.usd_all;
             f.hours += m.all.hours;
-            if !m.source.is_empty() && !f.sources.contains(&m.source) {
-                f.sources.push(m.source.clone());
-            }
         }
         let mut list: Vec<(String, Fam)> = fams.into_iter().collect();
         list.sort_by(|a, b| b.1.usd.partial_cmp(&a.1.usd).unwrap_or(std::cmp::Ordering::Equal));
         if list.is_empty() {
             return;
         }
-        let total_fams = list.len();
         egui::Grid::new("fams")
-            .num_columns(5)
-            .spacing([12.0, 4.0])
+            .num_columns(7)
+            .spacing([10.0, 4.0])
             .striped(true)
             .show(ui, |ui| {
-                for h in ["模型族", "会话", "msg", "输出", "≈$"] {
+                for h in ["模型族", "会话", "输入", "输出", "缓存读", "时长", "≈$"] {
                     ui.label(egui::RichText::new(h).weak().small());
                 }
                 ui.end_row();
-                for (name, f) in list.iter().take(10) {
-                    let src = if f.sources.len() > 1 { "·" } else { "" };
-                    ui.label(format!("{}{}", name, src));
+                for (name, f) in &list {
+                    ui.label(name);
                     ui.monospace(format!("{}", f.sessions));
-                    ui.monospace(format!("{}", f.msgs));
+                    ui.monospace(tok_zh(f.tin));
                     ui.monospace(tok_zh(f.tout));
+                    ui.monospace(tok_zh(f.tcr));
+                    ui.monospace(format!("{:.1}h", f.hours));
                     ui.monospace(format!("${:.2}", f.usd));
                     ui.end_row();
                 }
-                if total_fams > 10 {
-                    ui.label(format!("…等 {} 族", total_fams));
-                    ui.end_row();
-                }
+            });
+
+        // 具体型号全列表（可折叠）
+        egui::CollapsingHeader::new(format!("具体型号（{} 个）", self.st.all_models.len()))
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::Grid::new("models_all")
+                    .num_columns(7)
+                    .spacing([10.0, 3.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for h in ["源", "模型", "会话", "输入", "输出", "缓存读", "≈$"] {
+                            ui.label(egui::RichText::new(h).weak().small());
+                        }
+                        ui.end_row();
+                        for m in &self.st.all_models {
+                            ui.label(egui::RichText::new(&m.source).small().weak());
+                            ui.label(egui::RichText::new(&m.model).small());
+                            ui.monospace(format!("{}", m.all.sessions));
+                            ui.monospace(tok_zh(m.all.tin));
+                            ui.monospace(tok_zh(m.all.tout));
+                            ui.monospace(tok_zh(m.all.tcr));
+                            ui.monospace(format!("${:.2}", m.usd_all));
+                            ui.end_row();
+                        }
+                    });
             });
     }
 }
@@ -578,9 +707,34 @@ impl eframe::App for Panel {
                         );
                     }
                     ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("每日 token（M）· 悬停看明细").small().weak(),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("每日 token（M）· 点柱子看当日").small().weak(),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let cur = self.sel_day.clone().unwrap_or_else(|| "选择日期".into());
+                                egui::ComboBox::from_id_salt("daypick")
+                                    .selected_text(cur)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(self.sel_day.is_none(), "不选")
+                                            .clicked()
+                                        {
+                                            self.sel_day = None;
+                                        }
+                                        for d in self.charts.daily.iter().rev() {
+                                            ui.selectable_value(
+                                                &mut self.sel_day,
+                                                Some(d.ymd.clone()),
+                                                &d.ymd,
+                                            );
+                                        }
+                                    });
+                            },
+                        );
+                    });
                     self.daily_plot(ui);
                     if self.charts.daily.is_empty() {
                         ui.label(egui::RichText::new("暂无记录").weak().small());
@@ -592,6 +746,7 @@ impl eframe::App for Panel {
                             .weak()
                             .small(),
                         );
+                        self.day_detail(ui);
                     }
                 });
                 ui.add_space(6.0);
