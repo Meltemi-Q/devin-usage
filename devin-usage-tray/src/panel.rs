@@ -189,6 +189,17 @@ fn load_day_detail(ymd: &str) -> (i64, Vec<(String, i64, i64, i64, i64, i64)>) {
     (n_sess, rows)
 }
 
+/// 小额美元不显示成 $0.00：>=0.01 用两位，再小用四位，0 显示 —
+fn usd(v: f64) -> String {
+    if v >= 0.01 {
+        format!("${:.2}", v)
+    } else if v > 0.0 {
+        format!("${:.4}", v)
+    } else {
+        "—".into()
+    }
+}
+
 /// 中文量级：572.7M→5.7亿，3.5M→350万，更直观（面板专用，托盘/报告仍用 M/k）
 fn tok_zh(v: i64) -> String {
     let v = v as f64;
@@ -511,15 +522,18 @@ impl Panel {
                     ui.monospace(tok_zh(f.tout));
                     ui.monospace(tok_zh(f.tcr));
                     ui.monospace(format!("{:.1}h", f.hours));
-                    ui.monospace(format!("${:.2}", f.usd));
+                    ui.monospace(usd(f.usd));
                     ui.end_row();
                 }
             });
 
-        // 具体型号全列表（可折叠）
+        // 具体型号全列表（可折叠；型号名长，包横向滚动条）
         egui::CollapsingHeader::new(format!("具体型号（{} 个）", self.st.all_models.len()))
             .default_open(false)
             .show(ui, |ui| {
+                egui::ScrollArea::horizontal()
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
                 egui::Grid::new("models_all")
                     .num_columns(7)
                     .spacing([10.0, 3.0])
@@ -529,6 +543,13 @@ impl Panel {
                             ui.label(egui::RichText::new(h).weak().small());
                         }
                         ui.end_row();
+                        ui.label(
+                            egui::RichText::new(
+                                "gpt-6-astra / gpt-5-6-* 等为 Devin 内部模型，无公开价，按 gpt 档折算",
+                            )
+                            .weak()
+                            .small(),
+                        );
                         for m in &self.st.all_models {
                             ui.label(egui::RichText::new(&m.source).small().weak());
                             ui.label(egui::RichText::new(&m.model).small());
@@ -536,9 +557,10 @@ impl Panel {
                             ui.monospace(tok_zh(m.all.tin));
                             ui.monospace(tok_zh(m.all.tout));
                             ui.monospace(tok_zh(m.all.tcr));
-                            ui.monospace(format!("${:.2}", m.usd_all));
+                            ui.monospace(usd(m.usd_all));
                             ui.end_row();
                         }
+                    });
                     });
             });
     }
