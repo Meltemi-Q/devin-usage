@@ -37,6 +37,8 @@ pub struct Stats {
     pub swe2_usd_all: f64,
     pub last_collect_ago: String,
     pub has_db: bool,
+    /// 全模型行（面板表格用；per_model 仍是 swe-2 专供托盘菜单）
+    pub all_models: Vec<ModelRow>,
 }
 
 pub struct Quota {
@@ -60,6 +62,7 @@ pub struct Agg {
 }
 
 pub struct ModelRow {
+    pub source: String,
     pub model: String,
     pub all: Agg,
     pub d7: Agg,
@@ -274,6 +277,7 @@ pub fn load_stats() -> Stats {
             for row in rows.flatten().take(6) {
                 let usd = cost(&row.1, price_of(&row.0, &rules));
                 st.per_model.push(ModelRow {
+                    source: String::new(),
                     model: row.0,
                     all: row.1,
                     d7: Agg::default(),
@@ -291,6 +295,58 @@ pub fn load_stats() -> Stats {
         }) {
             for (model, a) in rows.flatten() {
                 if let Some(m) = st.per_model.iter_mut().find(|m| m.model == model) {
+                    m.usd_7d = cost(&a, price_of(&model, &rules));
+                    m.d7 = a;
+                }
+            }
+        }
+    }
+
+    // 全模型行：面板用（50+ 个 Cascade 内部模型也在里面），按 token 总量排序
+    const SELSM: &str = "SELECT source, model, count(*), sum(n_user), sum(n_tool_calls),
+                        sum(last_activity_at - created_at),
+                        sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
+                        FROM local_sessions";
+    if let Ok(mut stmt) = conn.prepare(&format!(
+        "{SELSM} GROUP BY source, model
+         ORDER BY sum(ifnull(tok_in,0)+ifnull(tok_out,0)+ifnull(tok_cache_read,0)+ifnull(tok_cache_write,0)) DESC
+         LIMIT 40"
+    )) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                agg(r, 2)?,
+            ))
+        }) {
+            for (src, mdl, a) in rows.flatten() {
+                st.all_models.push(ModelRow {
+                    source: src,
+                    model: mdl.clone(),
+                    all: a.clone(),
+                    d7: Agg::default(),
+                    usd_all: cost(&a, price_of(&mdl, &rules)),
+                    usd_7d: 0.0,
+                });
+            }
+        }
+    }
+    if let Ok(mut stmt) =
+        conn.prepare(&format!("{SELSM} WHERE created_at>=?1 GROUP BY source, model"))
+    {
+        if let Ok(rows) = stmt.query_map([t7], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                agg(r, 2)?,
+            ))
+        }) {
+            for (src, model, a) in rows.flatten() {
+                if let Some(m) = st
+                    .all_models
+                    .iter_mut()
+                    .find(|m| m.model == model && m.source == src)
+                {
                     m.usd_7d = cost(&a, price_of(&model, &rules));
                     m.d7 = a;
                 }
