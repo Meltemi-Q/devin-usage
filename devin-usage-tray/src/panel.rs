@@ -531,36 +531,38 @@ impl Panel {
         egui::CollapsingHeader::new(format!("具体型号（{} 个）", self.st.all_models.len()))
             .default_open(false)
             .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "gpt-6-astra / gpt-5-6-* 等为 Devin 内部模型，无公开价，按 gpt 档折算",
+                    )
+                    .weak()
+                    .small(),
+                );
                 egui::ScrollArea::horizontal()
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                egui::Grid::new("models_all")
-                    .num_columns(7)
-                    .spacing([10.0, 3.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for h in ["源", "模型", "会话", "输入", "输出", "缓存读", "≈$"] {
-                            ui.label(egui::RichText::new(h).weak().small());
-                        }
-                        ui.end_row();
-                        ui.label(
-                            egui::RichText::new(
-                                "gpt-6-astra / gpt-5-6-* 等为 Devin 内部模型，无公开价，按 gpt 档折算",
-                            )
-                            .weak()
-                            .small(),
-                        );
-                        for m in &self.st.all_models {
-                            ui.label(egui::RichText::new(&m.source).small().weak());
-                            ui.label(egui::RichText::new(&m.model).small());
-                            ui.monospace(format!("{}", m.all.sessions));
-                            ui.monospace(tok_zh(m.all.tin));
-                            ui.monospace(tok_zh(m.all.tout));
-                            ui.monospace(tok_zh(m.all.tcr));
-                            ui.monospace(usd(m.usd_all));
-                            ui.end_row();
-                        }
-                    });
+                        egui::Grid::new("models_all")
+                            .num_columns(6)
+                            .spacing([10.0, 3.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for h in ["型号", "会话", "输入", "输出", "缓存读", "≈$"] {
+                                    ui.label(egui::RichText::new(h).weak().small());
+                                }
+                                ui.end_row();
+                                for m in &self.st.all_models {
+                                    ui.label(
+                                        egui::RichText::new(format!("{}·{}", m.source, m.model))
+                                            .small(),
+                                    );
+                                    ui.monospace(format!("{}", m.all.sessions));
+                                    ui.monospace(tok_zh(m.all.tin));
+                                    ui.monospace(tok_zh(m.all.tout));
+                                    ui.monospace(tok_zh(m.all.tcr));
+                                    ui.monospace(usd(m.usd_all));
+                                    ui.end_row();
+                                }
+                            });
                     });
             });
     }
