@@ -1,0 +1,11 @@
+[package]
+name = "devin-usage-tray"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arboard = "3.6.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tray-icon = "0.25.1"
+winit = "0.30.13"

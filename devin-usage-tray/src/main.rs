@@ -1,0 +1,617 @@
+#![windows_subsystem = "windows"]
+//! devin-usage-tray — Windows 托盘图标，实时显示 Devin 用量
+//!
+//! 只读 `data/usage.db`（由同目录 devin_usage.py collect 产出），不写任何 Devin 文件。
+//! 菜单每 60s 重建刷新；"立即采集"调用 python devin_usage.py collect。
+
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use rusqlite::{Connection, OpenFlags};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::{Icon, TrayIconBuilder};
+use winit::application::ApplicationHandler;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::window::WindowId;
+
+const REFRESH: Duration = Duration::from_secs(60);
+const COLLECT_REFRESH_DELAY: Duration = Duration::from_secs(8);
+
+// ---------------------------------------------------------------- 数据
+
+#[derive(Default)]
+struct Stats {
+    quota: Option<Quota>,
+    swe2_7d: Agg,
+    swe2_all: Agg,
+    per_model: Vec<ModelRow>,
+    total_7d: Agg,
+    total_all: Agg,
+    usd_7d: f64,
+    usd_all: f64,
+    swe2_usd_7d: f64,
+    swe2_usd_all: f64,
+    last_collect_ago: String,
+    has_db: bool,
+}
+
+struct Quota {
+    plan: String,
+    weekly_pct: f64,
+    overage_usd: f64,
+    daily_reset: i64,
+    weekly_reset: i64,
+}
+
+#[derive(Default, Clone)]
+struct Agg {
+    sessions: i64,
+    msgs: i64,
+    tools: i64,
+    hours: f64,
+    tin: i64,   // input tokens
+    tout: i64,  // output tokens
+    tcr: i64,   // cache-read tokens
+    tcw: i64,   // cache-write tokens
+}
+
+struct ModelRow {
+    model: String,
+    all: Agg,
+    d7: Agg,
+    usd_all: f64,
+    usd_7d: f64,
+}
+
+/// 每 1M token 美元价格规则（prefix 首个命中；"" 兜底）——与 devin_usage.py 同源，
+/// 主数据在 db 的 model_prices 表（collect 时写入，含 data/prices.json 覆盖）
+#[derive(Clone)]
+struct PriceRule(f64, f64, f64, f64);
+
+fn load_prices(conn: &Connection) -> Vec<(String, PriceRule)> {
+    let mut v = Vec::new();
+    if let Ok(mut s) = conn.prepare(
+        "SELECT prefix, in_per_1m, out_per_1m, cr_per_1m, cw_per_1m
+         FROM model_prices ORDER BY prio",
+    ) {
+        if let Ok(rows) = s.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                PriceRule(r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?),
+            ))
+        }) {
+            v.extend(rows.flatten());
+        }
+    }
+    if v.is_empty() {
+        // 兜底内置（collect 还没写过表时）
+        v.push(("swe-2".into(), PriceRule(3.0, 15.0, 0.30, 3.75)));
+        v.push(("claude".into(), PriceRule(3.0, 15.0, 0.30, 3.75)));
+        v.push(("gpt".into(), PriceRule(1.25, 10.0, 0.125, 1.25)));
+        v.push(("".into(), PriceRule(3.0, 15.0, 0.30, 3.75)));
+    }
+    v
+}
+
+fn price_of<'a>(model: &str, rules: &'a [(String, PriceRule)]) -> &'a PriceRule {
+    let m = model.to_lowercase();
+    rules
+        .iter()
+        .find(|(p, _)| m.starts_with(p.as_str()))
+        .or_else(|| rules.last())
+        .map(|(_, r)| r)
+        .unwrap()
+}
+
+fn cost(a: &Agg, p: &PriceRule) -> f64 {
+    (a.tin as f64 * p.0 + a.tout as f64 * p.1 + a.tcr as f64 * p.2
+        + a.tcw as f64 * p.3)
+        / 1e6
+}
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 从 exe 向上找含 devin_usage.py 的目录（exe 在 devin-usage-tray/target/{profile}/ 下）
+fn project_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    for anc in exe.ancestors().skip(1).take(6) {
+        if anc.join("devin_usage.py").is_file() {
+            return Some(anc.to_path_buf());
+        }
+    }
+    None
+}
+
+fn open_db() -> Option<Connection> {
+    let dir = project_dir()?;
+    let db = dir.join("data").join("usage.db");
+    if !db.is_file() {
+        return None;
+    }
+    Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()
+}
+
+fn agg(r: &rusqlite::Row, base: usize) -> rusqlite::Result<Agg> {
+    Ok(Agg {
+        sessions: r.get::<_, Option<i64>>(base)?.unwrap_or(0),
+        msgs: r.get::<_, Option<i64>>(base + 1)?.unwrap_or(0),
+        tools: r.get::<_, Option<i64>>(base + 2)?.unwrap_or(0),
+        hours: r.get::<_, Option<i64>>(base + 3)?.unwrap_or(0) as f64 / 3600.0,
+        tin: r.get::<_, Option<i64>>(base + 4)?.unwrap_or(0),
+        tout: r.get::<_, Option<i64>>(base + 5)?.unwrap_or(0),
+        tcr: r.get::<_, Option<i64>>(base + 6)?.unwrap_or(0),
+        tcw: r.get::<_, Option<i64>>(base + 7)?.unwrap_or(0),
+    })
+}
+
+/// token 人性化: 1234→1.2k 4500000→4.5M
+fn tok(v: i64) -> String {
+    let v = v as f64;
+    for (u, d) in [("B", 1e9), ("M", 1e6), ("k", 1e3)] {
+        if v.abs() >= d {
+            return format!("{:.1}{}", v / d, u);
+        }
+    }
+    format!("{}", v as i64)
+}
+
+fn load_stats() -> Stats {
+    let mut st = Stats {
+        last_collect_ago: "从未".into(),
+        ..Stats::default()
+    };
+    let Some(conn) = open_db() else {
+        return st;
+    };
+    st.has_db = true;
+    let n = now();
+    let t7 = n - 7 * 86400;
+
+    st.quota = conn
+        .query_row(
+            "SELECT plan_name, weekly_quota_remaining_pct, overage_balance_micros,
+                    daily_reset, weekly_reset
+             FROM quota_snapshots ORDER BY ts DESC LIMIT 1",
+            [],
+            |r| {
+                Ok(Quota {
+                    plan: r.get::<_, Option<String>>(0)?.unwrap_or_else(|| "?".into()),
+                    weekly_pct: r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                    overage_usd: r.get::<_, Option<i64>>(2)?.unwrap_or(0) as f64 / 1e6,
+                    daily_reset: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    weekly_reset: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                })
+            },
+        )
+        .ok();
+
+    if let Ok(ts) = conn.query_row(
+        "SELECT MAX(ts) FROM collect_runs WHERE status='ok'",
+        [],
+        |r| r.get::<_, Option<i64>>(0),
+    ) {
+        if let Some(ts) = ts {
+            let d = (n - ts).max(0);
+            st.last_collect_ago = if d < 90 {
+                format!("{d}秒前")
+            } else if d < 5400 {
+                format!("{}分钟前", d / 60)
+            } else {
+                format!("{}小时前", d / 3600)
+            };
+        }
+    }
+
+    const SEL: &str = "SELECT count(*), sum(n_user), sum(n_tool_calls),
+                       sum(last_activity_at - created_at),
+                       sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
+                       FROM local_sessions";
+
+    st.swe2_all = conn
+        .query_row(&format!("{SEL} WHERE model LIKE 'swe-2%'"), [], |r| {
+            agg(r, 0)
+        })
+        .unwrap_or_default();
+    st.swe2_7d = conn
+        .query_row(
+            &format!("{SEL} WHERE model LIKE 'swe-2%' AND created_at>=?1"),
+            [t7],
+            |r| agg(r, 0),
+        )
+        .unwrap_or_default();
+    st.total_7d = conn
+        .query_row(&format!("{SEL} WHERE created_at>=?1"), [t7], |r| {
+            agg(r, 0)
+        })
+        .unwrap_or_default();
+    st.total_all = conn
+        .query_row(SEL, [], |r| agg(r, 0))
+        .unwrap_or_default();
+
+    // 等效成本：db 里的 model_prices 规则表（首个 prefix 命中）
+    let rules = load_prices(&conn);
+    st.swe2_usd_7d = cost(&st.swe2_7d, price_of("swe-2", &rules));
+    st.swe2_usd_all = cost(&st.swe2_all, price_of("swe-2", &rules));
+    // 全模型成本：逐模型行按各自价格累计
+    for (sql, args, dst) in [
+        (format!("{SELM} GROUP BY model"), vec![], &mut st.usd_all),
+        (format!("{SELM} WHERE created_at>=?1 GROUP BY model"), vec![t7], &mut st.usd_7d),
+    ] {
+        if let Ok(mut s) = conn.prepare(&sql) {
+            if let Ok(rows) = s.query_map(rusqlite::params_from_iter(args), |r| {
+                Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), agg(r, 1)?))
+            }) {
+                for (mdl, a) in rows.flatten() {
+                    *dst += cost(&a, price_of(&mdl, &rules));
+                }
+            }
+        }
+    }
+
+    const SELM: &str = "SELECT model, count(*), sum(n_user), sum(n_tool_calls),
+                        sum(last_activity_at - created_at),
+                        sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
+                        FROM local_sessions";
+    if let Ok(mut stmt) = conn.prepare(&format!(
+        "{SELM} WHERE model LIKE 'swe-2%' GROUP BY model ORDER BY 2 DESC"
+    )) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), agg(r, 1)?))
+        }) {
+            for row in rows.flatten().take(6) {
+                let usd = cost(&row.1, price_of(&row.0, &rules));
+                st.per_model.push(ModelRow {
+                    model: row.0,
+                    all: row.1,
+                    d7: Agg::default(),
+                    usd_all: usd,
+                    usd_7d: 0.0,
+                });
+            }
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare(&format!(
+        "{SELM} WHERE model LIKE 'swe-2%' AND created_at>=?1 GROUP BY model"
+    )) {
+        if let Ok(rows) = stmt.query_map([t7], |r| {
+            Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), agg(r, 1)?))
+        }) {
+            for (model, a) in rows.flatten() {
+                if let Some(m) = st.per_model.iter_mut().find(|m| m.model == model) {
+                    m.usd_7d = cost(&a, price_of(&model, &rules));
+                    m.d7 = a;
+                }
+            }
+        }
+    }
+    st
+}
+
+// ---------------------------------------------------------------- 图标
+
+const LOGO_PNG: &[u8] = include_bytes!("../assets/devin-logo.png");
+
+/// 32x32 托盘图标像素：白底圆角卡片 + Devin 黑色标志 + 右下配额状态点装饰
+/// quota_pct: 周配额剩余 %（None→灰点）
+fn paint_icon(quota_pct: Option<f64>) -> Vec<u8> {
+    let (w, h) = (32usize, 32usize);
+    let mut px = vec![0u8; w * h * 4];
+    let put = |px: &mut [u8], x: i32, y: i32, c: [u8; 4]| {
+        if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+            let i = (y as usize * w + x as usize) * 4;
+            // 简单 alpha 叠加
+            let a = c[3] as u16;
+            let ia = 255 - a;
+            px[i] = ((c[0] as u16 * a + px[i] as u16 * ia) / 255) as u8;
+            px[i + 1] = ((c[1] as u16 * a + px[i + 1] as u16 * ia) / 255) as u8;
+            px[i + 2] = ((c[2] as u16 * a + px[i + 2] as u16 * ia) / 255) as u8;
+            px[i + 3] = 255;
+        }
+    };
+    // 白底圆角卡片
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let (dx, dy) = (
+                if x < 6 { 6 - x } else { (x - 25).max(0) },
+                if y < 6 { 6 - y } else { (y - 25).max(0) },
+            );
+            if dx * dx + dy * dy <= 36 {
+                let shade = if y > 26 { 232 } else { 245 }; // 底部微阴影
+                put(&mut px, x, y, [shade, shade, shade + 3, 255]);
+            }
+        }
+    }
+    // Devin logo 缩到 26x26 居中贴上
+    if let Ok(img) = image::load_from_memory(LOGO_PNG) {
+        let logo = image::imageops::resize(
+            &img.to_rgba8(),
+            26,
+            26,
+            image::imageops::FilterType::Lanczos3,
+        );
+        for (lx, ly, p) in logo.enumerate_pixels() {
+            let (x, y) = (lx as i32 + 3, ly as i32 + 3);
+            if p[3] > 0 {
+                put(&mut px, x, y, [p[0], p[1], p[2], p[3]]);
+            }
+        }
+    }
+    // 右下状态点：白圈 + 配额色芯
+    let dot = match quota_pct {
+        None => [150, 150, 150, 255],
+        Some(p) if p >= 50.0 => [52, 199, 89, 255],   // 绿
+        Some(p) if p >= 20.0 => [255, 190, 90, 255],  // 琥珀
+        Some(_) => [255, 90, 90, 255],                // 红
+    };
+    let (cx, cy, r) = (24i32, 24i32, 6i32);
+    for y in (cy - r - 2)..=(cy + r + 2) {
+        for x in (cx - r - 2)..=(cx + r + 2) {
+            let d2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+            if d2 <= r * r {
+                put(&mut px, x, y, dot);
+            } else if d2 <= (r + 2) * (r + 2) {
+                put(&mut px, x, y, [255, 255, 255, 255]); // 白描边
+            }
+        }
+    }
+    px
+}
+
+fn make_icon(quota_pct: Option<f64>) -> Icon {
+    Icon::from_rgba(paint_icon(quota_pct), 32, 32).expect("icon")
+}
+
+// ---------------------------------------------------------------- UI
+
+struct App {
+    tray: tray_icon::TrayIcon,
+    id_collect: MenuId,
+    id_copy: MenuId,
+    id_quit: MenuId,
+    next_refresh: Instant,
+    refresh_after_collect: Option<Instant>,
+    last_report: String,
+}
+
+impl App {
+    fn new() -> Self {
+        let menu = Menu::new();
+        menu.append(&MenuItem::new("Devin 用量 · 加载中…", false, None))
+            .ok();
+        let tray = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("Devin 用量")
+            .with_icon(make_icon(None))
+            .build()
+            .expect("tray icon");
+        let mut app = App {
+            tray,
+            id_collect: MenuId::new("collect"),
+            id_copy: MenuId::new("copy"),
+            id_quit: MenuId::new("quit"),
+            next_refresh: Instant::now(),
+            refresh_after_collect: None,
+            last_report: String::new(),
+        };
+        app.refresh();
+        app
+    }
+
+    fn item(id: &str, text: impl AsRef<str>, enabled: bool) -> MenuItem {
+        MenuItem::with_id(MenuId::new(id), text, enabled, None)
+    }
+
+    fn refresh(&mut self) {
+        let st = load_stats();
+        let menu = Menu::new();
+        let add = |m: &Menu, text: String| {
+            menu.append(&MenuItem::new(text, false, None)).ok();
+            let _ = m;
+        };
+
+        if !st.has_db {
+            menu.append(&MenuItem::new("Devin 用量 — 无数据", false, None))
+                .ok();
+            menu.append(&MenuItem::new(
+                "先跑: python devin_usage.py collect",
+                false,
+                None,
+            ))
+            .ok();
+        } else {
+            add(&menu, format!("Devin 用量 · 采集于 {}", st.last_collect_ago));
+            let mut report = String::new();
+            if let Some(q) = &st.quota {
+                add(
+                    &menu,
+                    format!(
+                        "配额[{}]: 周剩 {:.0}% · 超额 ${:.2}",
+                        q.plan, q.weekly_pct, q.overage_usd
+                    ),
+                );
+                let dl = (q.daily_reset - now()).max(0);
+                let wl = (q.weekly_reset - now()).max(0);
+                add(
+                    &menu,
+                    format!("重置: 日 {}h后 · 周 {:.1}天后", dl / 3600, wl as f64 / 86400.0),
+                );
+                report.push_str(&format!(
+                    "Devin [{}] 周配额剩余 {:.0}% · 超额余额 ${:.2}\n",
+                    q.plan, q.weekly_pct, q.overage_usd
+                ));
+            }
+            menu.append(&PredefinedMenuItem::separator()).ok();
+            add(
+                &menu,
+                format!(
+                    "SWE-2 近7天: {}会话 · 入{} · 出{} · 缓{}",
+                    st.swe2_7d.sessions,
+                    tok(st.swe2_7d.tin),
+                    tok(st.swe2_7d.tout),
+                    tok(st.swe2_7d.tcr + st.swe2_7d.tcw)
+                ),
+            );
+            add(
+                &menu,
+                format!(
+                    "全部模型近7天: 入{} · 出{} · 缓{}",
+                    tok(st.total_7d.tin),
+                    tok(st.total_7d.tout),
+                    tok(st.total_7d.tcr + st.total_7d.tcw)
+                ),
+            );
+            add(
+                &menu,
+                format!(
+                    "等效成本: 7天 ${:.2} · SWE-2 ${:.2} · 累计 ${:.2}",
+                    st.usd_7d, st.swe2_usd_7d, st.usd_all
+                ),
+            );
+            report.push_str(&format!(
+                "SWE-2 近7天: {}会话 {}msg {}tool | in={} out={} cache_read={} cache_write={}\n",
+                st.swe2_7d.sessions, st.swe2_7d.msgs, st.swe2_7d.tools,
+                st.swe2_7d.tin, st.swe2_7d.tout, st.swe2_7d.tcr, st.swe2_7d.tcw
+            ));
+            report.push_str(&format!(
+                "SWE-2 全部: {}会话 {}msg {}tool {:.1}h | in={} out={} cr={} cw={}\n",
+                st.swe2_all.sessions, st.swe2_all.msgs, st.swe2_all.tools,
+                st.swe2_all.hours, st.swe2_all.tin, st.swe2_all.tout,
+                st.swe2_all.tcr, st.swe2_all.tcw
+            ));
+            report.push_str(&format!(
+                "等效$近7天: ${:.2} (SWE-2 ${:.2}) | 累计 ${:.2} (SWE-2 ${:.2})  [公开API价折算]\n",
+                st.usd_7d, st.swe2_usd_7d, st.usd_all, st.swe2_usd_all
+            ));
+            report.push_str(&format!(
+                "本地总计近7天: {}会话 {}msg {}tool | in={} out={} cr={} cw={}\n",
+                st.total_7d.sessions, st.total_7d.msgs, st.total_7d.tools,
+                st.total_7d.tin, st.total_7d.tout, st.total_7d.tcr, st.total_7d.tcw
+            ));
+            for m in &st.per_model {
+                add(
+                    &menu,
+                    format!(
+                        "  {}  7d:{}会话 出{} ≈${:.2} | 总:{}会话 ≈${:.2}",
+                        m.model, m.d7.sessions, tok(m.d7.tout), m.usd_7d,
+                        m.all.sessions, m.usd_all
+                    ),
+                );
+                report.push_str(&format!(
+                    "  {}  7d:{}会话 out={} ≈${:.2} | all:{}会话 {}msg {}tool in={} out={} cr={} cw={} ≈${:.2} {:.1}h\n",
+                    m.model, m.d7.sessions, m.d7.tout, m.usd_7d, m.all.sessions, m.all.msgs,
+                    m.all.tools, m.all.tin, m.all.tout, m.all.tcr, m.all.tcw, m.usd_all, m.all.hours
+                ));
+            }
+            self.last_report = report;
+            let tip = format!(
+                "Devin {}% · SWE-2 {}会话 出{}/7d",
+                st.quota.as_ref().map(|q| q.weekly_pct as i64).unwrap_or(0),
+                st.swe2_7d.sessions,
+                tok(st.swe2_7d.tout)
+            );
+            let _ = self.tray.set_tooltip(Some(&tip[..tip.len().min(120)]));
+            let _ = self
+                .tray
+                .set_icon(Some(make_icon(st.quota.as_ref().map(|q| q.weekly_pct))));
+        }
+
+        menu.append(&PredefinedMenuItem::separator()).ok();
+        let it_collect = Self::item("collect", "立即采集", true);
+        let it_copy = Self::item("copy", "复制文本报告", true);
+        let it_quit = Self::item("quit", "退出", true);
+        self.id_collect = it_collect.id().clone();
+        self.id_copy = it_copy.id().clone();
+        self.id_quit = it_quit.id().clone();
+        menu.append(&it_collect).ok();
+        menu.append(&it_copy).ok();
+        menu.append(&PredefinedMenuItem::separator()).ok();
+        menu.append(&it_quit).ok();
+        self.tray.set_menu(Some(Box::new(menu)));
+    }
+
+    fn collect_now(&mut self) {
+        let Some(dir) = project_dir() else { return };
+        let script = dir.join("devin_usage.py");
+        #[cfg(target_os = "macos")]
+        let pys = ["python3".to_string(), "/usr/bin/python3".to_string()];
+        #[cfg(not(target_os = "macos"))]
+        let pys = [
+            "python".to_string(),
+            "py".to_string(),
+            r"C:\Users\meltemi\scoop\apps\miniconda3\current\python.exe".to_string(),
+        ];
+        for py in pys {
+            if Command::new(&py)
+                .arg(&script)
+                .arg("collect")
+                .current_dir(&dir)
+                .spawn()
+                .is_ok()
+            {
+                self.refresh_after_collect = Some(Instant::now() + COLLECT_REFRESH_DELAY);
+                return;
+            }
+        }
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, _el: &ActiveEventLoop) {}
+    fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, _e: WindowEvent) {}
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        while let Ok(ev) = MenuEvent::receiver().try_recv() {
+            if ev.id == self.id_collect {
+                self.collect_now();
+            } else if ev.id == self.id_copy {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    let _ = cb.set_text(self.last_report.clone());
+                }
+            } else if ev.id == self.id_quit {
+                el.exit();
+                return;
+            }
+        }
+        if Instant::now() >= self.next_refresh {
+            self.refresh();
+            self.next_refresh = Instant::now() + REFRESH;
+        }
+        if let Some(t) = self.refresh_after_collect {
+            if Instant::now() >= t {
+                self.refresh_after_collect = None;
+                self.refresh();
+            }
+        }
+        el.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_millis(250),
+        ));
+    }
+}
+
+fn main() {
+    if std::env::args().any(|a| a == "--dump-icon") {
+        for (name, pct) in [("icon-green", Some(75.0)), ("icon-amber", Some(30.0)),
+                            ("icon-red", Some(5.0)), ("icon-gray", None)] {
+            let px = paint_icon(pct);
+            image::save_buffer(
+                format!("{name}.png"), &px, 32, 32, image::ColorType::Rgba8,
+            )
+            .unwrap();
+        }
+        println!("icons dumped");
+        return;
+    }
+    let el = EventLoop::new().expect("event loop");
+    let mut app = App::new();
+    el.run_app(&mut app).expect("run");
+}
