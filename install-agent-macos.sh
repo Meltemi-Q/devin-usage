@@ -29,6 +29,7 @@ EOF
 launchctl unload "$PLIST" 2>/dev/null || true
 launchctl load "$PLIST"
 echo "tray agent loaded"
+bash "$DIR/bundle-macos.sh" || true   # 面板 .app（菜单栏拥挤时用）
 else
     echo "tray exe not found, skipping (build: cd devin-usage-tray && cargo build --release)"
 fi

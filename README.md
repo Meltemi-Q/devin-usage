@@ -69,7 +69,7 @@ python devin_usage.py runs             # 采集健康日志
 SWE-2 近7天: N会话 · 入X.XM · 出XXk · 缓XXXM
 等效成本: 7天 $X · SWE-2 $Y · 累计 $Z
   swe-2-max  7d:N会话 出XXk ≈$Z | 总:N会话 ≈$W
-[立即采集] [复制文本报告] [退出]
+[立即采集] [打开面板] [复制文本报告] [退出]
 ```
 
 图标 = Devin logo 白卡 + 配额状态点（绿≥50% / 琥珀≥20% / 红<20%）。
@@ -80,7 +80,14 @@ cd devin-usage-tray && cargo build --release
 # macOS:   target/release/devin-usage-tray
 ```
 
-依赖：tray-icon + winit + rusqlite(bundled) + arboard + image。
+**面板模式**（`--panel`）：egui 轻量窗口——配额进度条、SWE-2/分模型明细、
+等效成本、[立即采集]/[复制报告]/[置顶]。适合菜单栏拥挤图标被系统隐藏、
+或想要桌面小组件的场景；托盘菜单"打开面板"可直接唤起。
+
+macOS 打 App：`bash bundle-macos.sh` 生成 `~/Applications/DevinUsage.app`
+（含 icns 图标），Dock/Spotlight 可启动，不占菜单栏。
+
+依赖：tray-icon + winit + eframe(egui) + rusqlite(bundled) + arboard + image。
 Windows 构建需要链接器：`x86_64-pc-windows-gnu` 工具链 + mingw（或 MSVC）。
 exe 从 `target/release/` 向上自动定位 `devin_usage.py`/`data/usage.db`。
 

@@ -16,61 +16,63 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
 
+mod panel;
+
 const REFRESH: Duration = Duration::from_secs(60);
 const COLLECT_REFRESH_DELAY: Duration = Duration::from_secs(8);
 
 // ---------------------------------------------------------------- 数据
 
 #[derive(Default)]
-struct Stats {
-    quota: Option<Quota>,
-    swe2_7d: Agg,
-    swe2_all: Agg,
-    per_model: Vec<ModelRow>,
-    total_7d: Agg,
-    total_all: Agg,
-    usd_7d: f64,
-    usd_all: f64,
-    swe2_usd_7d: f64,
-    swe2_usd_all: f64,
-    last_collect_ago: String,
-    has_db: bool,
+pub struct Stats {
+    pub quota: Option<Quota>,
+    pub swe2_7d: Agg,
+    pub swe2_all: Agg,
+    pub per_model: Vec<ModelRow>,
+    pub total_7d: Agg,
+    pub total_all: Agg,
+    pub usd_7d: f64,
+    pub usd_all: f64,
+    pub swe2_usd_7d: f64,
+    pub swe2_usd_all: f64,
+    pub last_collect_ago: String,
+    pub has_db: bool,
 }
 
-struct Quota {
-    plan: String,
-    weekly_pct: f64,
-    overage_usd: f64,
-    daily_reset: i64,
-    weekly_reset: i64,
+pub struct Quota {
+    pub plan: String,
+    pub weekly_pct: f64,
+    pub overage_usd: f64,
+    pub daily_reset: i64,
+    pub weekly_reset: i64,
 }
 
 #[derive(Default, Clone)]
-struct Agg {
-    sessions: i64,
-    msgs: i64,
-    tools: i64,
-    hours: f64,
-    tin: i64,   // input tokens
-    tout: i64,  // output tokens
-    tcr: i64,   // cache-read tokens
-    tcw: i64,   // cache-write tokens
+pub struct Agg {
+    pub sessions: i64,
+    pub msgs: i64,
+    pub tools: i64,
+    pub hours: f64,
+    pub tin: i64,   // input tokens
+    pub tout: i64,  // output tokens
+    pub tcr: i64,   // cache-read tokens
+    pub tcw: i64,   // cache-write tokens
 }
 
-struct ModelRow {
-    model: String,
-    all: Agg,
-    d7: Agg,
-    usd_all: f64,
-    usd_7d: f64,
+pub struct ModelRow {
+    pub model: String,
+    pub all: Agg,
+    pub d7: Agg,
+    pub usd_all: f64,
+    pub usd_7d: f64,
 }
 
 /// 每 1M token 美元价格规则（prefix 首个命中；"" 兜底）——与 devin_usage.py 同源，
 /// 主数据在 db 的 model_prices 表（collect 时写入，含 data/prices.json 覆盖）
 #[derive(Clone)]
-struct PriceRule(f64, f64, f64, f64);
+pub struct PriceRule(f64, f64, f64, f64);
 
-fn load_prices(conn: &Connection) -> Vec<(String, PriceRule)> {
+pub fn load_prices(conn: &Connection) -> Vec<(String, PriceRule)> {
     let mut v = Vec::new();
     if let Ok(mut s) = conn.prepare(
         "SELECT prefix, in_per_1m, out_per_1m, cr_per_1m, cw_per_1m
@@ -95,7 +97,7 @@ fn load_prices(conn: &Connection) -> Vec<(String, PriceRule)> {
     v
 }
 
-fn price_of<'a>(model: &str, rules: &'a [(String, PriceRule)]) -> &'a PriceRule {
+pub fn price_of<'a>(model: &str, rules: &'a [(String, PriceRule)]) -> &'a PriceRule {
     let m = model.to_lowercase();
     rules
         .iter()
@@ -105,13 +107,13 @@ fn price_of<'a>(model: &str, rules: &'a [(String, PriceRule)]) -> &'a PriceRule 
         .unwrap()
 }
 
-fn cost(a: &Agg, p: &PriceRule) -> f64 {
+pub fn cost(a: &Agg, p: &PriceRule) -> f64 {
     (a.tin as f64 * p.0 + a.tout as f64 * p.1 + a.tcr as f64 * p.2
         + a.tcw as f64 * p.3)
         / 1e6
 }
 
-fn now() -> i64 {
+pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -119,7 +121,7 @@ fn now() -> i64 {
 }
 
 /// 从 exe 向上找含 devin_usage.py 的目录（exe 在 devin-usage-tray/target/{profile}/ 下）
-fn project_dir() -> Option<PathBuf> {
+pub fn project_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     for anc in exe.ancestors().skip(1).take(6) {
         if anc.join("devin_usage.py").is_file() {
@@ -129,7 +131,7 @@ fn project_dir() -> Option<PathBuf> {
     None
 }
 
-fn open_db() -> Option<Connection> {
+pub fn open_db() -> Option<Connection> {
     let dir = project_dir()?;
     let db = dir.join("data").join("usage.db");
     if !db.is_file() {
@@ -142,7 +144,7 @@ fn open_db() -> Option<Connection> {
     .ok()
 }
 
-fn agg(r: &rusqlite::Row, base: usize) -> rusqlite::Result<Agg> {
+pub fn agg(r: &rusqlite::Row, base: usize) -> rusqlite::Result<Agg> {
     Ok(Agg {
         sessions: r.get::<_, Option<i64>>(base)?.unwrap_or(0),
         msgs: r.get::<_, Option<i64>>(base + 1)?.unwrap_or(0),
@@ -156,7 +158,7 @@ fn agg(r: &rusqlite::Row, base: usize) -> rusqlite::Result<Agg> {
 }
 
 /// token 人性化: 1234→1.2k 4500000→4.5M
-fn tok(v: i64) -> String {
+pub fn tok(v: i64) -> String {
     let v = v as f64;
     for (u, d) in [("B", 1e9), ("M", 1e6), ("k", 1e3)] {
         if v.abs() >= d {
@@ -166,7 +168,7 @@ fn tok(v: i64) -> String {
     format!("{}", v as i64)
 }
 
-fn load_stats() -> Stats {
+pub fn load_stats() -> Stats {
     let mut st = Stats {
         last_collect_ago: "从未".into(),
         ..Stats::default()
@@ -304,7 +306,7 @@ const LOGO_PNG: &[u8] = include_bytes!("../assets/devin-logo.png");
 
 /// 32x32 托盘图标像素：白底圆角卡片 + Devin 黑色标志 + 右下配额状态点装饰
 /// quota_pct: 周配额剩余 %（None→灰点）
-fn paint_icon(quota_pct: Option<f64>) -> Vec<u8> {
+pub fn paint_icon(quota_pct: Option<f64>) -> Vec<u8> {
     let (w, h) = (32usize, 32usize);
     let mut px = vec![0u8; w * h * 4];
     let put = |px: &mut [u8], x: i32, y: i32, c: [u8; 4]| {
@@ -368,7 +370,7 @@ fn paint_icon(quota_pct: Option<f64>) -> Vec<u8> {
     px
 }
 
-fn make_icon(quota_pct: Option<f64>) -> Icon {
+pub fn make_icon(quota_pct: Option<f64>) -> Icon {
     Icon::from_rgba(paint_icon(quota_pct), 32, 32).expect("icon")
 }
 
@@ -377,6 +379,7 @@ fn make_icon(quota_pct: Option<f64>) -> Icon {
 struct App {
     tray: tray_icon::TrayIcon,
     id_collect: MenuId,
+    id_panel: MenuId,
     id_copy: MenuId,
     id_quit: MenuId,
     next_refresh: Instant,
@@ -398,6 +401,7 @@ impl App {
         let mut app = App {
             tray,
             id_collect: MenuId::new("collect"),
+            id_panel: MenuId::new("panel"),
             id_copy: MenuId::new("copy"),
             id_quit: MenuId::new("quit"),
             next_refresh: Instant::now(),
@@ -431,7 +435,6 @@ impl App {
             .ok();
         } else {
             add(&menu, format!("Devin 用量 · 采集于 {}", st.last_collect_ago));
-            let mut report = String::new();
             if let Some(q) = &st.quota {
                 add(
                     &menu,
@@ -446,10 +449,6 @@ impl App {
                     &menu,
                     format!("重置: 日 {}h后 · 周 {:.1}天后", dl / 3600, wl as f64 / 86400.0),
                 );
-                report.push_str(&format!(
-                    "Devin [{}] 周配额剩余 {:.0}% · 超额余额 ${:.2}\n",
-                    q.plan, q.weekly_pct, q.overage_usd
-                ));
             }
             menu.append(&PredefinedMenuItem::separator()).ok();
             add(
@@ -478,26 +477,6 @@ impl App {
                     st.usd_7d, st.swe2_usd_7d, st.usd_all
                 ),
             );
-            report.push_str(&format!(
-                "SWE-2 近7天: {}会话 {}msg {}tool | in={} out={} cache_read={} cache_write={}\n",
-                st.swe2_7d.sessions, st.swe2_7d.msgs, st.swe2_7d.tools,
-                st.swe2_7d.tin, st.swe2_7d.tout, st.swe2_7d.tcr, st.swe2_7d.tcw
-            ));
-            report.push_str(&format!(
-                "SWE-2 全部: {}会话 {}msg {}tool {:.1}h | in={} out={} cr={} cw={}\n",
-                st.swe2_all.sessions, st.swe2_all.msgs, st.swe2_all.tools,
-                st.swe2_all.hours, st.swe2_all.tin, st.swe2_all.tout,
-                st.swe2_all.tcr, st.swe2_all.tcw
-            ));
-            report.push_str(&format!(
-                "等效$近7天: ${:.2} (SWE-2 ${:.2}) | 累计 ${:.2} (SWE-2 ${:.2})  [公开API价折算]\n",
-                st.usd_7d, st.swe2_usd_7d, st.usd_all, st.swe2_usd_all
-            ));
-            report.push_str(&format!(
-                "本地总计近7天: {}会话 {}msg {}tool | in={} out={} cr={} cw={}\n",
-                st.total_7d.sessions, st.total_7d.msgs, st.total_7d.tools,
-                st.total_7d.tin, st.total_7d.tout, st.total_7d.tcr, st.total_7d.tcw
-            ));
             for m in &st.per_model {
                 add(
                     &menu,
@@ -507,13 +486,8 @@ impl App {
                         m.all.sessions, m.usd_all
                     ),
                 );
-                report.push_str(&format!(
-                    "  {}  7d:{}会话 out={} ≈${:.2} | all:{}会话 {}msg {}tool in={} out={} cr={} cw={} ≈${:.2} {:.1}h\n",
-                    m.model, m.d7.sessions, m.d7.tout, m.usd_7d, m.all.sessions, m.all.msgs,
-                    m.all.tools, m.all.tin, m.all.tout, m.all.tcr, m.all.tcw, m.usd_all, m.all.hours
-                ));
             }
-            self.last_report = report;
+            self.last_report = build_report(&st);
             let tip = format!(
                 "Devin {}% · SWE-2 {}会话 出{}/7d",
                 st.quota.as_ref().map(|q| q.weekly_pct as i64).unwrap_or(0),
@@ -528,12 +502,15 @@ impl App {
 
         menu.append(&PredefinedMenuItem::separator()).ok();
         let it_collect = Self::item("collect", "立即采集", true);
+        let it_panel = Self::item("panel", "打开面板", true);
         let it_copy = Self::item("copy", "复制文本报告", true);
         let it_quit = Self::item("quit", "退出", true);
         self.id_collect = it_collect.id().clone();
+        self.id_panel = it_panel.id().clone();
         self.id_copy = it_copy.id().clone();
         self.id_quit = it_quit.id().clone();
         menu.append(&it_collect).ok();
+        menu.append(&it_panel).ok();
         menu.append(&it_copy).ok();
         menu.append(&PredefinedMenuItem::separator()).ok();
         menu.append(&it_quit).ok();
@@ -541,29 +518,71 @@ impl App {
     }
 
     fn collect_now(&mut self) {
-        let Some(dir) = project_dir() else { return };
-        let script = dir.join("devin_usage.py");
-        #[cfg(target_os = "macos")]
-        let pys = ["python3".to_string(), "/usr/bin/python3".to_string()];
-        #[cfg(not(target_os = "macos"))]
-        let pys = [
-            "python".to_string(),
-            "py".to_string(),
-            r"C:\Users\meltemi\scoop\apps\miniconda3\current\python.exe".to_string(),
-        ];
-        for py in pys {
-            if Command::new(&py)
-                .arg(&script)
-                .arg("collect")
-                .current_dir(&dir)
-                .spawn()
-                .is_ok()
-            {
-                self.refresh_after_collect = Some(Instant::now() + COLLECT_REFRESH_DELAY);
-                return;
-            }
+        if spawn_collect() {
+            self.refresh_after_collect = Some(Instant::now() + COLLECT_REFRESH_DELAY);
         }
     }
+}
+
+/// 后台起 python devin_usage.py collect（托盘与面板共用）
+pub fn spawn_collect() -> bool {
+    let Some(dir) = project_dir() else { return false };
+    let script = dir.join("devin_usage.py");
+    #[cfg(target_os = "macos")]
+    let pys = ["python3", "/usr/bin/python3"];
+    #[cfg(not(target_os = "macos"))]
+    let pys = [
+        "python",
+        "py",
+        r"C:\Users\meltemi\scoop\apps\miniconda3\current\python.exe",
+    ];
+    pys.iter().any(|py| {
+        Command::new(py)
+            .arg(&script)
+            .arg("collect")
+            .current_dir(&dir)
+            .spawn()
+            .is_ok()
+    })
+}
+
+/// 文本报告（托盘"复制报告"与面板共用）
+pub fn build_report(st: &Stats) -> String {
+    let mut r = String::new();
+    if let Some(q) = &st.quota {
+        r.push_str(&format!(
+            "Devin [{}] 周配额剩余 {:.0}% · 超额余额 ${:.2}\n",
+            q.plan, q.weekly_pct, q.overage_usd
+        ));
+    }
+    r.push_str(&format!(
+        "SWE-2 近7天: {}会话 {}msg {}tool | in={} out={} cache_read={} cache_write={}\n",
+        st.swe2_7d.sessions, st.swe2_7d.msgs, st.swe2_7d.tools,
+        st.swe2_7d.tin, st.swe2_7d.tout, st.swe2_7d.tcr, st.swe2_7d.tcw
+    ));
+    r.push_str(&format!(
+        "SWE-2 全部: {}会话 {}msg {}tool {:.1}h | in={} out={} cr={} cw={}\n",
+        st.swe2_all.sessions, st.swe2_all.msgs, st.swe2_all.tools,
+        st.swe2_all.hours, st.swe2_all.tin, st.swe2_all.tout,
+        st.swe2_all.tcr, st.swe2_all.tcw
+    ));
+    r.push_str(&format!(
+        "等效$近7天: ${:.2} (SWE-2 ${:.2}) | 累计 ${:.2} (SWE-2 ${:.2})  [公开API价折算]\n",
+        st.usd_7d, st.swe2_usd_7d, st.usd_all, st.swe2_usd_all
+    ));
+    r.push_str(&format!(
+        "本地总计近7天: {}会话 {}msg {}tool | in={} out={} cr={} cw={}\n",
+        st.total_7d.sessions, st.total_7d.msgs, st.total_7d.tools,
+        st.total_7d.tin, st.total_7d.tout, st.total_7d.tcr, st.total_7d.tcw
+    ));
+    for m in &st.per_model {
+        r.push_str(&format!(
+            "  {}  7d:{}会话 out={} ≈${:.2} | all:{}会话 {}msg {}tool in={} out={} cr={} cw={} ≈${:.2} {:.1}h\n",
+            m.model, m.d7.sessions, m.d7.tout, m.usd_7d, m.all.sessions, m.all.msgs,
+            m.all.tools, m.all.tin, m.all.tout, m.all.tcr, m.all.tcw, m.usd_all, m.all.hours
+        ));
+    }
+    r
 }
 
 impl ApplicationHandler for App {
@@ -573,6 +592,10 @@ impl ApplicationHandler for App {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             if ev.id == self.id_collect {
                 self.collect_now();
+            } else if ev.id == self.id_panel {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = Command::new(exe).arg("--panel").spawn();
+                }
             } else if ev.id == self.id_copy {
                 if let Ok(mut cb) = arboard::Clipboard::new() {
                     let _ = cb.set_text(self.last_report.clone());
@@ -599,7 +622,8 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    if std::env::args().any(|a| a == "--dump-icon") {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--dump-icon") {
         for (name, pct) in [("icon-green", Some(75.0)), ("icon-amber", Some(30.0)),
                             ("icon-red", Some(5.0)), ("icon-gray", None)] {
             let px = paint_icon(pct);
@@ -611,7 +635,22 @@ fn main() {
         println!("icons dumped");
         return;
     }
-    let el = EventLoop::new().expect("event loop");
+    if args.iter().any(|a| a == "--panel") {
+        if let Err(e) = panel::run() {
+            eprintln!("panel: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[allow(unused_mut)]
+    let mut builder = EventLoop::builder();
+    #[cfg(target_os = "macos")]
+    {
+        // 纯托盘：不占 Dock 位（菜单栏拥挤时面板走 .app 启动）
+        use winit::platform::macos::EventLoopBuilderExtMacOS;
+        builder.with_activation_policy(winit::platform::macos::ActivationPolicy::Accessory);
+    }
+    let el = builder.build().expect("event loop");
     let mut app = App::new();
     el.run_app(&mut app).expect("run");
 }
