@@ -20,6 +20,10 @@ mod panel;
 
 const REFRESH: Duration = Duration::from_secs(60);
 const COLLECT_REFRESH_DELAY: Duration = Duration::from_secs(8);
+/// 托盘自身定时采集：进程活着就会每 15min 采一轮（不依赖任务计划/cron，
+/// 笔记本睡醒后下个周期自然恢复）；首次在启动 20s 后
+const COLLECT_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const FIRST_COLLECT_DELAY: Duration = Duration::from_secs(20);
 
 // ---------------------------------------------------------------- 数据
 
@@ -446,6 +450,7 @@ struct App {
     id_copy: MenuId,
     id_quit: MenuId,
     next_refresh: Instant,
+    next_collect: Instant,
     refresh_after_collect: Option<Instant>,
     last_report: String,
 }
@@ -468,6 +473,7 @@ impl App {
             id_copy: MenuId::new("copy"),
             id_quit: MenuId::new("quit"),
             next_refresh: Instant::now(),
+            next_collect: Instant::now() + FIRST_COLLECT_DELAY,
             refresh_after_collect: None,
             last_report: String::new(),
         };
@@ -671,6 +677,14 @@ impl ApplicationHandler for App {
         if Instant::now() >= self.next_refresh {
             self.refresh();
             self.next_refresh = Instant::now() + REFRESH;
+        }
+        // 托盘自驱动定时采集：进程在就有 15min 一轮，睡醒后自然续上
+        if Instant::now() >= self.next_collect {
+            if spawn_collect() {
+                // 采集完成后延迟刷新一次界面
+                self.refresh_after_collect = Some(Instant::now() + COLLECT_REFRESH_DELAY);
+            }
+            self.next_collect = Instant::now() + COLLECT_INTERVAL;
         }
         if let Some(t) = self.refresh_after_collect {
             if Instant::now() >= t {

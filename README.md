@@ -11,10 +11,14 @@ Windows + macOS + Linux（含无头 VPS）。
 | 平台 | 命令 | 装了什么 |
 |---|---|---|
 | Windows | `powershell -File install-task.ps1` | 15 分钟定时采集（任务计划）+ 托盘开机自启 |
-| macOS | `bash install-agent-macos.sh` | 15 分钟定时采集（crontab）+ 托盘常驻（launchd，RunAtLoad+KeepAlive） |
+| macOS | `bash install-agent-macos.sh` | 15 分钟定时采集（crontab）+ 托盘常驻（launchd，RunAtLoad+KeepAlive）+ 面板 .app |
 | Linux/VPS | `bash install-agent-linux.sh` | 15 分钟定时采集（crontab）；无 GUI 不装托盘 |
 
 卸载：各脚本加 `--uninstall` / `-Uninstall` 参数。
+
+**采集是双保险的**：托盘进程自身每 15min 也会采一轮（进程在就有采集，
+笔记本睡醒自然续上），任务计划/cron 是托盘没跑时的备份。
+界面刷新每 60s；"立即采集"立即触发一轮。
 
 前置要求：Python 3（仅标准库）；托盘需要 Rust 工具链构建
 （`cd devin-usage-tray && cargo build --release`），不构建则只装采集。

@@ -1,4 +1,4 @@
-# install-task.ps1 — 一键安装：15 分钟定时采集 + 托盘开机自启
+﻿# install-task.ps1 — 一键安装：15 分钟定时采集 + 托盘开机自启
 param([switch]$Uninstall)
 
 $TaskName = "DevinUsageCollect"
