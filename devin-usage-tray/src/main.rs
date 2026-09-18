@@ -606,12 +606,15 @@ pub fn spawn_collect() -> bool {
         r"C:\Users\meltemi\scoop\apps\miniconda3\current\python.exe",
     ];
     pys.iter().any(|py| {
-        Command::new(py)
-            .arg(&script)
-            .arg("collect")
-            .current_dir(&dir)
-            .spawn()
-            .is_ok()
+        let mut c = Command::new(py);
+        c.arg(&script).arg("collect").current_dir(&dir);
+        #[cfg(target_os = "windows")]
+        {
+            // CREATE_NO_WINDOW：采集不弹控制台窗口
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x08000000);
+        }
+        c.spawn().is_ok()
     })
 }
 

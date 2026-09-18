@@ -4,6 +4,9 @@ param([switch]$Uninstall)
 $TaskName = "DevinUsageCollect"
 $Py = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $Py) { $Py = "python" }
+# 优先用 pythonw.exe（无控制台窗口，采集不闪屏）
+$PyW = Join-Path (Split-Path $Py) "pythonw.exe"
+if (Test-Path $PyW) { $Py = $PyW }
 $Script = Join-Path $PSScriptRoot "devin_usage.py"
 $TrayExe = Join-Path $PSScriptRoot "devin-usage-tray\target\release\devin-usage-tray.exe"
 $Shortcut = Join-Path ([Environment]::GetFolderPath("Startup")) "devin-usage-tray.lnk"
