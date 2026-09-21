@@ -332,18 +332,27 @@ fn quota_line(
             egui::Label::new(egui::RichText::new(name).small()).truncate(),
         );
         let frac = (pct / 100.0).clamp(0.0, 1.0) as f32;
-        let bar_w = (ui.available_width() - tail_w - 6.0).clamp(50.0, 400.0);
-        let bar_txt = if pct <= 0.0 {
-            egui::RichText::new("已用尽").color(egui::Color32::WHITE)
-        } else {
-            egui::RichText::new(format!("{:.0}%", pct))
-        };
+        // 百分比占固定 34px，条吃中间剩余
+        let bar_w =
+            (ui.available_width() - tail_w - 34.0 - 12.0).clamp(40.0, 400.0);
         ui.add(
             egui::ProgressBar::new(frac)
                 .desired_width(bar_w)
-                .desired_height(13.0)
-                .fill(quota_color(pct))
-                .text(bar_txt),
+                .desired_height(10.0)
+                .fill(quota_color(pct)),
+        );
+        ui.add_sized(
+            [34.0, 16.0],
+            egui::Label::new(
+                if pct <= 0.0 {
+                    egui::RichText::new("用尽").color(RED).small()
+                } else {
+                    egui::RichText::new(format!("{pct:.0}%"))
+                        .color(quota_color(pct))
+                        .small()
+                },
+            )
+            .truncate(),
         );
         if !tail.is_empty() {
             ui.label(egui::RichText::new(tail).weak().small());
@@ -541,6 +550,9 @@ impl Panel {
         let ymax = max_tot / div;
         let presp = Plot::new("daily")
             .height(120.0)
+            .allow_drag(false)
+            .allow_zoom(false)
+            .allow_scroll(false)
             .include_y(0.0)
             .include_y(ymax * 1.12)            // 给柱顶标签留位
             .x_axis_formatter(Self::x_fmt(&labels, 7))
@@ -710,7 +722,10 @@ impl Panel {
             f.hours += m.all.hours;
         }
         let mut list: Vec<(String, Fam)> = fams.into_iter().collect();
-        list.sort_by(|a, b| b.1.usd.partial_cmp(&a.1.usd).unwrap_or(std::cmp::Ordering::Equal));
+        // 按消耗量（token 总量）降序
+        list.sort_by(|a, b| {
+            (b.1.tin + b.1.tout + b.1.tcr).cmp(&(a.1.tin + a.1.tout + a.1.tcr))
+        });
         if list.is_empty() {
             return;
         }
@@ -727,15 +742,16 @@ impl Panel {
                         }
                         ui.end_row();
                         for (name, f) in &list {
-                            ui.add(
-                                egui::Label::new(name)
-                                    .truncate(),
-                            );
+                            ui.label(name);
                             ui.monospace(format!("{}", f.sessions));
                             ui.monospace(tok_zh(f.tin));
                             ui.monospace(tok_zh(f.tout));
                             ui.monospace(tok_zh(f.tcr));
-                            ui.monospace(format!("{:.1}h", f.hours));
+                            ui.monospace(if f.hours > 0.0 {
+                                format!("{:.1}h", f.hours)
+                            } else {
+                                "—".into()
+                            });
                             ui.monospace(usd(f.usd));
                             ui.end_row();
                         }
@@ -762,12 +778,9 @@ impl Panel {
                                 }
                                 ui.end_row();
                                 for m in models {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(format!("{}·{}", m.source, m.model))
-                                                .small(),
-                                        )
-                                        .truncate(),
+                                    ui.label(
+                                        egui::RichText::new(format!("{}·{}", m.source, m.model))
+                                            .small(),
                                     );
                                     ui.monospace(format!("{}", m.all.sessions));
                                     ui.monospace(tok_zh(m.all.tin));
