@@ -530,9 +530,8 @@ fn load_app_stats(
     };
     // 配额快照：每 label 取最新一条
     if let Ok(mut s) = conn.prepare(
-        "SELECT label, pct_remaining, resets_at, used, lim FROM app_quota q
-         WHERE app=?1 AND ts=(SELECT max(ts) FROM app_quota
-                              WHERE app=q.app AND label=q.label)
+        "SELECT label, pct_remaining, resets_at, used, lim FROM app_quota
+         WHERE app=?1 AND ts=(SELECT max(ts) FROM app_quota WHERE app=?1)
          ORDER BY CASE label WHEN 'plan' THEN 0 WHEN '_plan' THEN 1
                              WHEN 'auto' THEN 2 WHEN 'api' THEN 3
                              ELSE 9 END, label",

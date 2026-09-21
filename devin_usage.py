@@ -959,6 +959,9 @@ def collect_antigravity_quota(c) -> int:
         configs = ((us.get("cascadeModelConfigData") or {})
                    .get("clientModelConfigs")
                    or resp.get("clientModelConfigs") or [])
+        # 配额按共享池聚合：Gemini 全系一个池，Claude/GPT 等第三方一个池
+        # （同池内各档位 remainingFraction/resetTime 完全一致）
+        pools = {}
         for cfg in configs:
             qi = cfg.get("quotaInfo")
             if not qi:
@@ -974,11 +977,14 @@ def collect_antigravity_quota(c) -> int:
                 resets = None
             label = (cfg.get("label")
                      or (cfg.get("modelOrAlias") or {}).get("model") or "?")
+            pool = "Gemini" if label.startswith("Gemini") else "Claude · GPT"
+            cur = pools.get(pool)
+            if cur is None or frac < cur[0]:
+                pools[pool] = (frac, resets)
+        for pool, (frac, resets) in pools.items():
             c.execute("INSERT OR REPLACE INTO app_quota "
                       "VALUES('antigravity',?,?,?,?,?,?,?)",
-                      (label, now, frac * 100, None, None, resets,
-                       json.dumps({"model": (cfg.get("modelOrAlias") or {})
-                                   .get("model")})))
+                      (pool, now, frac * 100, None, None, resets, "{}"))
             n += 1
         break                                    # 第一个可用进程就够
     log_run(c, "antigravity-quota",
