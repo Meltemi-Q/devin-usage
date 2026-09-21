@@ -1128,9 +1128,88 @@ def collect_zcode(c) -> int:
     return n_sess
 
 
+GROK_PROXY = "https://cli-chat-proxy.grok.com/v1"
+
+
+def _grok_access_token():
+    """~/.grok/auth.json → 未过期 access token。
+    刷新交给 grok CLI 自己做（refresh_token 会轮换，碰了可能顶掉 CLI 会话）。"""
+    try:
+        d = json.loads((Path.home() / ".grok/auth.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    now = int(time.time())
+    for k in d.values():
+        tok = k.get("key")
+        exp = _iso_ts(k.get("expires_at"))
+        if tok and (exp is None or exp > now + 60):
+            return tok
+    return None
+
+
+def _grok_headers(tok):
+    try:
+        ver = (json.loads((Path.home() / ".grok/version.json")
+                          .read_text(encoding="utf-8")).get("version") or "1.0.0")
+    except Exception:
+        ver = "1.0.0"
+    return {"Authorization": f"Bearer {tok}", "User-Agent": f"xai-grok-cli/{ver}",
+            "x-grok-client-version": ver, "x-grok-client-identifier": "xai-grok-cli",
+            "Accept": "application/json"}
+
+
+def collect_grok_quota(c) -> int:
+    """Grok 周额度：GET cli-chat-proxy.grok.com/v1/billing?format=credits。
+    与 CLI 自带 billing 面板（WEEKLY/MONTHLY）同源：
+    config.currentPeriod{type:WEEKLY, start, end} + creditUsagePercent(已用%)
+    + productUsage 分产品(GrokChat/GrokBuild)。resets_at = currentPeriod.end。"""
+    tok = _grok_access_token()
+    if not tok:
+        log_run(c, "grok-quota", "skip", "无有效 access token")
+        return 0
+    req = urllib.request.Request(f"{GROK_PROXY}/billing?format=credits",
+                                 headers=_grok_headers(tok))
+    cfg = (json.loads(urllib.request.urlopen(req, timeout=15).read())
+           or {}).get("config") or {}
+    period = cfg.get("currentPeriod") or {}
+    resets = _iso_ts(period.get("end") or cfg.get("billingPeriodEnd"))
+    try:
+        pay = json.loads((Path.home() / ".grok/settings_cache.json")
+                         .read_text(encoding="utf-8")).get("payload")
+        pay = json.loads(pay) if isinstance(pay, str) else (pay or {})
+        tier = (pay.get("settings") or {}).get("subscription_tier_display")
+    except Exception:
+        tier = None
+    meta = json.dumps({"period": period.get("type"), "tier": tier})
+    if tier:
+        c.execute("INSERT OR REPLACE INTO kv VALUES('grok.plan',?)", (tier,))
+    now = int(time.time())
+    n = 0
+    used = cfg.get("creditUsagePercent")
+    if used is not None:
+        c.execute("INSERT OR REPLACE INTO app_quota VALUES('grok','周额度',?,?,?,?,?,?)",
+                  (now, max(0.0, 100.0 - float(used)), float(used), 100.0,
+                   resets, meta))
+        n += 1
+    for pu in cfg.get("productUsage") or []:
+        u = pu.get("usagePercent")
+        if u is None:
+            continue
+        c.execute("INSERT OR REPLACE INTO app_quota VALUES('grok',?,?,?,?,?,?,?)",
+                  (pu.get("product") or "?", now, max(0.0, 100.0 - float(u)),
+                   float(u), 100.0, resets, None))
+        n += 1
+    return n
+
+
 def collect_grok(c) -> int:
     """~/.grok/sessions/*/*/{updates.jsonl,summary.json} → usage_events + local_sessions。
     turn_completed.usage 含全量 token + costUsdTicks(1e-9 USD) + modelUsage 分模型。"""
+    try:
+        n_q = collect_grok_quota(c)
+        log_run(c, "grok-quota", "ok", f"{n_q} 行")
+    except Exception as e:
+        log_run(c, "grok-quota", "error", str(e))
     roots = Path.home() / ".grok/sessions"
     if not roots.exists():
         log_run(c, "grok", "skip", "~/.grok/sessions 不存在")
