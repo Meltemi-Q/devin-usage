@@ -299,52 +299,55 @@ fn quota_line(
     used: Option<f64>,
     lim: Option<f64>,
 ) {
+    // 尾巴文本（用量 · 重置）先算出来，宽度按字符估：ASCII≈6.5px，CJK≈13px
+    let mut tail = String::new();
+    if let (Some(u), Some(l)) = (used, lim) {
+        tail += &format!("{}/{}", u as i64, l as i64);
+    }
+    if let Some(r) = resets {
+        let left = r - now();
+        if !tail.is_empty() {
+            tail.push_str(" · ");
+        }
+        tail += &format!(
+            "重置 {}",
+            if left <= 0 {
+                "待刷新".to_string()
+            } else if left >= 86400 {
+                format!("{}d{}h", left / 86400, left % 86400 / 3600)
+            } else {
+                format!("{}h", left / 3600)
+            }
+        );
+    }
+    let tail_w: f32 = tail
+        .chars()
+        .map(|ch| if ch.is_ascii() { 6.6 } else { 13.0 })
+        .sum::<f32>()
+        + 4.0;
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
         ui.add_sized(
-            [96.0, 16.0],
+            [92.0, 16.0],
             egui::Label::new(egui::RichText::new(name).small()).truncate(),
         );
         let frac = (pct / 100.0).clamp(0.0, 1.0) as f32;
-        let mut tail = String::new();
-        if let (Some(u), Some(l)) = (used, lim) {
-            tail += &format!("{}/{}", u as i64, l as i64);
+        let bar_w = (ui.available_width() - tail_w - 6.0).clamp(50.0, 400.0);
+        let bar_txt = if pct <= 0.0 {
+            egui::RichText::new("已用尽").color(egui::Color32::WHITE)
+        } else {
+            egui::RichText::new(format!("{:.0}%", pct))
+        };
+        ui.add(
+            egui::ProgressBar::new(frac)
+                .desired_width(bar_w)
+                .desired_height(13.0)
+                .fill(quota_color(pct))
+                .text(bar_txt),
+        );
+        if !tail.is_empty() {
+            ui.label(egui::RichText::new(tail).weak().small());
         }
-        if let Some(r) = resets {
-            let left = r - now();
-            if !tail.is_empty() {
-                tail.push_str(" · ");
-            }
-            tail += &format!(
-                "重置{}",
-                if left <= 0 {
-                    "待刷新".to_string()
-                } else if left >= 86400 {
-                    format!("{}d{}h", left / 86400, left % 86400 / 3600)
-                } else {
-                    format!("{}h", left / 3600)
-                }
-            );
-        }
-        // 右侧：用量+重置弱文本；中间：百分比直接写进进度条
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if !tail.is_empty() {
-                ui.label(egui::RichText::new(tail).weak().small());
-                ui.add_space(8.0);
-            }
-            let w = ui.available_width().clamp(60.0, 400.0);
-            let bar_txt = if pct <= 0.0 {
-                egui::RichText::new("已用尽").color(egui::Color32::WHITE)
-            } else {
-                egui::RichText::new(format!("剩 {:.0}%", pct))
-            };
-            ui.add(
-                egui::ProgressBar::new(frac)
-                    .desired_width(w)
-                    .desired_height(13.0)
-                    .fill(quota_color(pct))
-                    .text(bar_txt),
-            );
-        });
     });
 }
 
@@ -1185,7 +1188,7 @@ impl eframe::App for Panel {
                             ui.add_space(2.0);
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "会话 {}（7d {}）· 请求 {}",
+                                    "{} 会话（7天 {}）· {} 次请求",
                                     ap.sessions_all,
                                     ap.sessions_7d,
                                     ap.total_all.sessions
