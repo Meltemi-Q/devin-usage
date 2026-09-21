@@ -213,6 +213,19 @@ def log_run(c, source, status, detail=""):
               (int(time.time()), source, status, detail[:500]))
 
 
+def _ro(path) -> sqlite3.Connection:
+    """只读打开第三方 sqlite：优先 URI mode=ro，失败（macOS URI 解析问题）退回普通连接。
+    普通连接也绝不写入——只用 SELECT。"""
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        con.execute("PRAGMA query_only=1")
+        return con
+    except sqlite3.Error:
+        con = sqlite3.connect(str(path))
+        con.execute("PRAGMA query_only=1")
+        return con
+
+
 # ---------------------------------------------------------------- collect
 
 def _post_json(url, payload, timeout=25):
@@ -320,8 +333,7 @@ def collect_local(c):
         log_run(c, "local", "skip", f"{LOCAL_DB} 不存在")
         return 0
     now = int(time.time())
-    src = sqlite3.connect(f"file:{LOCAL_DB}?mode=ro", uri=True)
-    src.execute("PRAGMA query_only=1")
+    src = _ro(LOCAL_DB)
     n = 0
     rows = src.execute("""
         SELECT s.id, s.model, s.agent_mode, s.backend_type, s.working_directory,
@@ -418,8 +430,7 @@ def _cursor_item(key: str) -> "str | None":
     """从 Cursor state.vscdb ItemTable 读一个值（只读）。"""
     dbp = _cursor_state_db()
     try:
-        con = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
-        con.execute("PRAGMA query_only=1")
+        con = _ro(dbp)
         row = con.execute("SELECT value FROM ItemTable WHERE key=?", (key,)).fetchone()
         con.close()
         return row[0] if row else None
@@ -529,8 +540,7 @@ def _collect_cursor_local(c) -> int:
     dbp = _cursor_state_db()
     if not dbp.exists():
         return 0
-    src = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
-    src.execute("PRAGMA query_only=1")
+    src = _ro(dbp)
     now = int(time.time())
     n = 0
     try:
@@ -770,8 +780,7 @@ def collect_antigravity(c):
     n_ev = n_sess = 0
     for p in dbs:
         try:
-            src = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
-            src.execute("PRAGMA query_only=1")
+            src = _ro(p)
             meta = src.execute(
                 "SELECT trajectory_id, cascade_id FROM trajectory_meta LIMIT 1").fetchone()
             tid = (meta[0] or meta[1]) if meta else p.stem

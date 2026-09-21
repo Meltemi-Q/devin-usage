@@ -112,7 +112,8 @@ struct DayRow {
 
 #[derive(Default)]
 struct Charts {
-    quota: Vec<(String, f64)>, // (MM-DD HH:MM, 剩余%)
+    quota: Vec<(String, f64)>, // (MM-DD HH:MM, 剩余%) —— devin 单线
+    quota_hist: Vec<(String, Vec<(String, f64)>)>, // 非 devin：每配额标签一条线
     daily: Vec<DayRow>,
 }
 
@@ -131,6 +132,31 @@ fn load_charts(days: i64, app: &str) -> Charts {
                 s.query_map([t0], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
             {
                 c.quota = rows.flatten().collect();
+            }
+        }
+    } else if app != "all" {
+        // cursor/antigravity 等：app_quota 每标签一条历史线
+        if let Ok(mut s) = conn.prepare(
+            "SELECT label, strftime('%m-%d %H:%M', ts, 'unixepoch', 'localtime'),
+                    pct_remaining
+             FROM app_quota WHERE app = ?1 AND ts >= ?2
+             ORDER BY label, ts",
+        ) {
+            if let Ok(rows) = s.query_map(rusqlite::params![app, t0], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
+            }) {
+                let mut map: Vec<(String, Vec<(String, f64)>)> = Vec::new();
+                for (label, mdhm, pct) in rows.flatten() {
+                    match map.iter_mut().find(|(l, _)| *l == label) {
+                        Some((_, v)) => v.push((mdhm, pct)),
+                        None => map.push((label, vec![(mdhm, pct)])),
+                    }
+                }
+                c.quota_hist = map;
             }
         }
     }
@@ -315,40 +341,48 @@ fn quota_line(
 ) {
     ui.horizontal(|ui| {
         ui.add_sized(
-            [150.0, 16.0],
+            [118.0, 16.0],
             egui::Label::new(egui::RichText::new(name).small()).truncate(),
         );
         let frac = (pct / 100.0).clamp(0.0, 1.0) as f32;
-        ui.add(
-            egui::ProgressBar::new(frac)
-                .desired_width(110.0)
-                .desired_height(10.0)
-                .fill(quota_color(pct)),
-        );
-        let pct_txt = if pct <= 0.0 {
-            egui::RichText::new("已用尽").color(RED).small()
-        } else {
-            egui::RichText::new(format!("剩 {pct:.0}%")).small()
-        };
-        ui.add(egui::Label::new(pct_txt));
         let mut tail = String::new();
         if let (Some(u), Some(l)) = (used, lim) {
-            tail += &format!(" {}/{}", u as i64, l as i64);
+            tail += &format!(" · {}/{}", u as i64, l as i64);
         }
         if let Some(r) = resets {
             let left = r - now();
             tail += &format!(
-                " · 重置 {}",
+                " · 重置{}",
                 if left <= 0 {
                     "待刷新".to_string()
                 } else if left >= 86400 {
-                    format!("{}d{}h后", left / 86400, left % 86400 / 3600)
+                    format!("{}d{}h", left / 86400, left % 86400 / 3600)
                 } else {
-                    format!("{}h后", left / 3600)
+                    format!("{}h", left / 3600)
                 }
             );
         }
-        ui.label(egui::RichText::new(tail).weak().small());
+        let pct_txt = if pct <= 0.0 {
+            format!("已用尽{tail}")
+        } else {
+            format!("剩 {pct:.0}%{tail}")
+        };
+        // 右对齐信息串，进度条填满中间剩余宽度
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(pct_txt)
+                    .small()
+                    .color(if pct <= 0.0 { RED } else { egui::Color32::GRAY }),
+            );
+            ui.add_space(8.0);
+            let w = ui.available_width().clamp(40.0, 400.0);
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .desired_width(w)
+                    .desired_height(9.0)
+                    .fill(quota_color(pct)),
+            );
+        });
     });
 }
 
@@ -492,6 +526,54 @@ impl Panel {
                 pui.points(
                     egui_plot::Points::new("周配额剩余", pts).color(GREEN).radius(2.0_f32),
                 );
+            });
+    }
+
+    /// 非 Devin 应用的配额历史：app_quota 每标签一条线
+    fn quota_hist_plot(&self, ui: &mut egui::Ui) {
+        // 所有标签共用时间轴：取最长的那组标签做刻度
+        let labels: Vec<String> = self
+            .charts
+            .quota_hist
+            .iter()
+            .max_by_key(|(_, v)| v.len())
+            .map(|(_, v)| v.iter().map(|(l, _)| l.clone()).collect())
+            .unwrap_or_default();
+        let palette = [C_IN, C_OUT, C_CR, C_CW, GREEN, AMBER];
+        let series: Vec<(String, Vec<[f64; 2]>)> = self
+            .charts
+            .quota_hist
+            .iter()
+            .map(|(label, v)| {
+                (
+                    label.clone(),
+                    v.iter().enumerate().map(|(i, (_, p))| [i as f64, *p]).collect(),
+                )
+            })
+            .collect();
+        let min_v = series
+            .iter()
+            .flat_map(|(_, v)| v.iter().map(|p| p[1]))
+            .fold(f64::INFINITY, f64::min);
+        let ymin = ((min_v / 20.0).floor() * 20.0 - 5.0).clamp(0.0, 80.0);
+        Plot::new("quota_hist")
+            .height(95.0)
+            .include_y(ymin)
+            .include_y(100.0)
+            .x_axis_formatter(Self::x_fmt(&labels, 4))
+            .y_axis_formatter(|m, _| format!("{:.0}%", m.value))
+            .label_formatter(|name, p| format!("{name} {:.0}%", p.y))
+            .legend(Legend::default().position(egui_plot::Corner::LeftTop))
+            .show(ui, |pui| {
+                for (i, (name, pts)) in series.iter().enumerate() {
+                    let col = palette[i % palette.len()];
+                    pui.line(Line::new(name.clone(), pts.clone()).color(col).width(1.6_f32));
+                    pui.points(
+                        egui_plot::Points::new(name.clone(), pts.clone())
+                            .color(col)
+                            .radius(1.8_f32),
+                    );
+                }
             });
     }
 
@@ -1027,6 +1109,29 @@ impl eframe::App for Panel {
                                     .small(),
                             );
                         }
+                        ui.add_space(4.0);
+                    } else if !self.charts.quota_hist.is_empty() {
+                        ui.label(egui::RichText::new("配额剩余 %").small().weak());
+                        self.quota_hist_plot(ui);
+                        if self
+                            .charts
+                            .quota_hist
+                            .iter()
+                            .all(|(_, v)| v.len() < 2)
+                        {
+                            ui.label(
+                                egui::RichText::new("历史积累中（每 15min 一条）")
+                                    .weak()
+                                    .small(),
+                            );
+                        }
+                        ui.add_space(4.0);
+                    } else if self.tab == "cursor" || self.tab == "antigravity" {
+                        ui.label(
+                            egui::RichText::new("配额历史暂无（Antigravity 需 IDE 运行）")
+                                .weak()
+                                .small(),
+                        );
                         ui.add_space(4.0);
                     }
                     ui.add_space(6.0);
