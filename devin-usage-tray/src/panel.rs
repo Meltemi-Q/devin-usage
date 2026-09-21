@@ -324,7 +324,11 @@ impl Panel {
             s += &format!("套餐: {}\n", ap.plan);
         }
         for (label, pct, resets, used, lim) in &ap.quota_rows {
-            let mut l = format!("配额 {}: 剩 {:.0}%", label.trim_start_matches('_'), pct);
+            let mut l = if *pct <= 0.0 {
+                format!("配额 {}: 已用尽", label.trim_start_matches('_'))
+            } else {
+                format!("配额 {}: 剩 {:.0}%", label.trim_start_matches('_'), pct)
+            };
             if let (Some(u), Some(lm)) = (used, lim) {
                 l += &format!(" ({}/{})", *u as i64, *lm as i64);
             }
@@ -1038,12 +1042,17 @@ impl eframe::App for Panel {
                                                 .desired_height(10.0)
                                                 .fill(quota_color(*pct)),
                                         );
-                                        ui.monospace(
+                                        let pct_txt = if *pct <= 0.0 {
+                                            egui::RichText::new("已用尽")
+                                                .color(RED)
+                                                .small()
+                                        } else {
                                             egui::RichText::new(format!(
                                                 "剩 {pct:.0}%"
                                             ))
-                                            .small(),
-                                        );
+                                            .small()
+                                        };
+                                        ui.add(egui::Label::new(pct_txt));
                                         let mut tail = String::new();
                                         if let (Some(u), Some(l)) = (used, lim) {
                                             tail += &format!(

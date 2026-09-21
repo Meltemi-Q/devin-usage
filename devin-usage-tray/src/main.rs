@@ -545,7 +545,41 @@ fn load_app_stats(
                 r.get::<_, Option<f64>>(4)?,
             ))
         }) {
-            a.quota_rows = rows.flatten().collect();
+            // 归并：antigravity 同模型的推理档位 "(High|Low|Medium|Thinking)"
+            // 共享配额，按基名合并——取最紧剩余% + 最早重置时间
+            let mut grouped: Vec<(String, f64, Option<i64>, Option<f64>, Option<f64>)> =
+                Vec::new();
+            for (label, pct, resets, used, lim) in rows.flatten() {
+                let base = if label.ends_with(')') {
+                    label
+                        .rfind('(')
+                        .map(|i| label[..i].trim_end().to_string())
+                        .unwrap_or(label)
+                } else {
+                    label
+                };
+                if let Some(g) = grouped.iter_mut().find(|g| g.0 == base) {
+                    g.1 = g.1.min(pct); // 最紧的剩余%为准
+                    g.2 = match (g.2, resets) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    g.3 = g.3.or(used);
+                    g.4 = g.4.or(lim);
+                } else {
+                    grouped.push((base, pct, resets, used, lim));
+                }
+            }
+            // plan 类在前，模型行按剩余%升序（最紧张的最显眼）
+            grouped.sort_by(|x, y| {
+                let rank = |l: &str| match l {
+                    "plan" | "_plan" => 0,
+                    "auto" | "api" => 1,
+                    _ => 9,
+                };
+                rank(&x.0).cmp(&rank(&y.0)).then(x.1.total_cmp(&y.1))
+            });
+            a.quota_rows = grouped;
         }
     }
     // 附加信息：cursor 套餐 + tab/composer 采纳行数
