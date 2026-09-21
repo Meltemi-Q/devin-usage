@@ -205,6 +205,14 @@ def db() -> sqlite3.Connection:
     for col in ("tok_in", "tok_out", "tok_cache_read", "tok_cache_write", "gen_ms"):
         if col not in have:
             c.execute(f"ALTER TABLE local_sessions ADD COLUMN {col} INTEGER")
+    # 一次性修正：grok/zcode/antigravity 旧行的 tok_in 含缓存，扣除重复部分
+    if not c.execute(
+            "SELECT 1 FROM kv WHERE key='fix_cache_dedup_v1'").fetchone():
+        c.execute("""UPDATE usage_events
+                     SET tok_in = MAX(0, tok_in - tok_cache_read - tok_cache_write)
+                     WHERE app IN ('grok','zcode','antigravity')""")
+        c.execute("INSERT OR REPLACE INTO kv VALUES('fix_cache_dedup_v1','1')")
+        c.commit()
     return c
 
 
@@ -762,7 +770,9 @@ def _agy_gen_event(blob: bytes):
         except Exception:
             return None
     return {"model": _s(model), "label": _s(label),
-            "tin": sys_tok + tin, "tout": tout, "tcr": tcr, "ts": ts}
+            # Gemini 口径：promptTokenCount 含 cachedContent，扣掉避免重复计
+            "tin": max(0, sys_tok + tin - tcr), "tout": tout, "tcr": tcr,
+            "ts": ts}
 
 
 def collect_antigravity(c):
@@ -922,45 +932,60 @@ def _ag_ls_post(port, path, csrf, use_https=True):
         req, timeout=6, context=ctx if use_https else None).read())
 
 
+def _ag_ls_call(pid, csrf, method):
+    """对本机 language server 发一个 RPC，https 失败退回 http。返回 dict|None。"""
+    for port in _antigravity_ports(pid):
+        for https in (True, False):
+            try:
+                return _ag_ls_post(port, method, csrf, use_https=https)
+            except Exception:
+                continue
+    return None
+
+
 def collect_antigravity_quota(c) -> int:
-    """每模型剩余配额 + promptCredits，写 app_quota。IDE 不在跑就记 skip。"""
+    """RetrieveUserQuotaSummary → 每池 周限额+5小时限额 写 app_quota（与 IDE 官方页同口径）。
+    兜底用 GetUserStatus 的 per-model quotaInfo（只有 5h 窗口）。IDE 不在跑记 skip。"""
     n = 0
+    now = int(time.time())
     for pid, csrf in _antigravity_ls_procs():
         if not csrf:
             continue
-        resp = None
-        for port in _antigravity_ports(pid):
-            for path in ("/exa.language_server_pb.LanguageServerService/GetUserStatus",
-                         "/exa.language_server_pb.LanguageServerService/GetCommandModelConfigs"):
-                try:
-                    resp = _ag_ls_post(port, path, csrf)
-                    break
-                except Exception:
-                    try:
-                        resp = _ag_ls_post(port, path, csrf, use_https=False)
-                        break
-                    except Exception:
+        resp = _ag_ls_call(
+            pid, csrf,
+            "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary")
+        groups = ((resp or {}).get("response") or {}).get("groups") or []
+        if groups:
+            for g in groups:
+                gname = g.get("displayName") or ""
+                pool = "Gemini" if "Gemini" in gname else "Claude · GPT"
+                for b in g.get("buckets") or []:
+                    frac = _f(b.get("remainingFraction"))
+                    if frac is None:
                         continue
-            if resp:
-                break
+                    rt = b.get("resetTime")
+                    try:
+                        resets = int(datetime.fromisoformat(
+                            rt.replace("Z", "+00:00")).timestamp()) if rt else None
+                    except Exception:
+                        resets = None
+                    win = "周" if b.get("window") == "weekly" else "5h"
+                    c.execute("INSERT OR REPLACE INTO app_quota "
+                              "VALUES('antigravity',?,?,?,?,?,?,?)",
+                              (f"{pool} · {win}", now, frac * 100,
+                               None, None, resets, "{}"))
+                    n += 1
+            break                                # 第一个可用进程就够
+        # 兜底：GetUserStatus 的 per-model quotaInfo（5h 窗口）
+        resp = _ag_ls_call(
+            pid, csrf,
+            "/exa.language_server_pb.LanguageServerService/GetUserStatus")
         if not resp:
             continue
         us = resp.get("userStatus") or {}
-        plan = (us.get("planStatus") or {}).get("planInfo") or {}
-        now = int(time.time())
-        monthly = _f(plan.get("monthlyPromptCredits"))
-        avail = _f(plan.get("availablePromptCredits"))
-        if monthly and avail is not None:
-            c.execute("INSERT OR REPLACE INTO app_quota "
-                      "VALUES('antigravity','_plan',?,?,?,?,?,?)",
-                      (now, avail / monthly * 100, monthly - avail, monthly,
-                       None, json.dumps({"plan": plan.get("planName")})))
-            n += 1
         configs = ((us.get("cascadeModelConfigData") or {})
                    .get("clientModelConfigs")
                    or resp.get("clientModelConfigs") or [])
-        # 配额按共享池聚合：Gemini 全系一个池，Claude/GPT 等第三方一个池
-        # （同池内各档位 remainingFraction/resetTime 完全一致）
         pools = {}
         for cfg in configs:
             qi = cfg.get("quotaInfo")
@@ -984,7 +1009,7 @@ def collect_antigravity_quota(c) -> int:
         for pool, (frac, resets) in pools.items():
             c.execute("INSERT OR REPLACE INTO app_quota "
                       "VALUES('antigravity',?,?,?,?,?,?,?)",
-                      (pool, now, frac * 100, None, None, resets, "{}"))
+                      (f"{pool} · 5h", now, frac * 100, None, None, resets, "{}"))
             n += 1
         break                                    # 第一个可用进程就够
     log_run(c, "antigravity-quota",
@@ -1062,7 +1087,11 @@ def collect_zcode(c) -> int:
                         VALUES('zcode',?,?,?,?,'gen',?,?,?,?,?,NULL,?)""",
                         (e.get("id") or str(uuid.uuid4()), ts or 0, day, model,
                          f"zcode:{sid}",
-                         u.get("inputTokens") or 0, u.get("outputTokens") or 0,
+                         # inputTokens 含 cacheRead/cacheWrite，扣掉避免重复计
+                         max(0, (u.get("inputTokens") or 0)
+                             - (u.get("cacheReadTokens") or 0)
+                             - (u.get("cacheWriteTokens") or 0)),
+                         u.get("outputTokens") or 0,
                          u.get("cacheReadTokens") or 0,
                          u.get("cacheWriteTokens") or 0,
                          json.dumps({"querySource": pay.get("querySource")})))
@@ -1130,7 +1159,10 @@ def collect_grok(c) -> int:
                         VALUES('grok',?,?,?,?,'gen',?,?,?,?,?,?,?)""",
                         (f"{sid}:{pid}:{model}", ts, day, model,
                          f"grok:{sid}",
-                         mu1.get("inputTokens") or 0,
+                         # inputTokens 含 cachedRead/cacheCreation，扣掉避免重复计
+                         max(0, (mu1.get("inputTokens") or 0)
+                             - (mu1.get("cachedReadTokens") or 0)
+                             - (mu1.get("cacheCreationTokens") or 0)),
                          mu1.get("outputTokens") or 0,
                          mu1.get("cachedReadTokens") or 0,
                          mu1.get("cacheCreationTokens") or 0,
