@@ -104,8 +104,17 @@ cd devin-usage-tray && cargo build --release
 # macOS:   target/release/devin-usage-tray
 ```
 
-**面板模式**（`--panel`）：egui 轻量窗口——配额进度条、SWE-2/分模型明细、
-等效成本、[立即采集]/[复制报告]/[置顶]。适合菜单栏拥挤图标被系统隐藏、
+**面板模式**（`--panel`）：egui 轻量窗口——顶部 Devin / Cursor / Antigravity
+三个 Tab，各应用套餐/配额/计费完全独立、互不混计：
+
+- **Devin**：配额进度条 + 配额趋势线（仅 Devin 有配额概念）、SWE-2 汇总、
+  每日 token 堆叠柱、分模型族/具体型号表、等效成本
+- **Cursor**：套餐（plan）+ 会话/请求概要、每日 token 柱（usage_events 事件级）、
+  分模型表（含订阅外实扣）、行级采纳统计
+- **Antigravity**：会话/生成概要、每日 token 柱、分模型表、按 API 价折算
+
+每个 Tab 的图表/构成条/模型表/底部成本行都只统计所选应用。
+[立即采集]/[复制报告]/[置顶] 固定底栏。适合菜单栏拥挤图标被系统隐藏、
 或想要桌面小组件的场景；托盘菜单"打开面板"可直接唤起。
 
 macOS 打 App：`bash bundle-macos.sh` 生成 `~/Applications/DevinUsage.app`

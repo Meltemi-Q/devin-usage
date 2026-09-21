@@ -934,12 +934,14 @@ def cmd_report(args):
                       sum(n_user), sum(n_assistant), sum(n_tool_calls), sum(n_prompts),
                       sum(last_activity_at - created_at), sum(credit_cost), sum(acu_cost),
                       sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
-                      FROM local_sessions WHERE created_at>=? GROUP BY source, model
+                      FROM local_sessions WHERE created_at>=?
+                      AND source NOT IN ('cursor','antigravity')
+                      GROUP BY source, model
                       ORDER BY 3 DESC""", (since,)).fetchall()
     out["local_by_model"] = [
         {"source": r[0], "model": r[1] or "(default)", "sessions": r[2],
          "user_msgs": r[3], "assistant_msgs": r[4], "tool_calls": r[5],
-         "prompts": r[6], "lifespan_seconds": r[7] or 0,
+         "prompts": r[6], "lifespan_seconds": max(r[7] or 0, 0),
          "credit_cost": r[8] or 0, "acu_cost": r[9] or 0,
          "tok_in": r[10] or 0, "tok_out": r[11] or 0,
          "tok_cache_read": r[12] or 0, "tok_cache_write": r[13] or 0}
@@ -948,9 +950,12 @@ def cmd_report(args):
                        sum(last_activity_at-created_at),
                        sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
                        FROM local_sessions
-                       WHERE created_at>=?""", (since,)).fetchone()
+                       WHERE created_at>=?
+                       AND source NOT IN ('cursor','antigravity')""",
+                       (since,)).fetchone()
     out["local_totals"] = {"sessions": tot[0] or 0, "user_msgs": tot[1] or 0,
-                           "tool_calls": tot[2] or 0, "lifespan_seconds": tot[3] or 0,
+                           "tool_calls": tot[2] or 0,
+                           "lifespan_seconds": max(tot[3] or 0, 0),
                            "tok_in": tot[4] or 0, "tok_out": tot[5] or 0,
                            "tok_cache_read": tot[6] or 0, "tok_cache_write": tot[7] or 0}
 
@@ -986,7 +991,8 @@ def cmd_report(args):
         usd = cost_usd(r["tok_in"], r["tok_out"], r["tok_cache_read"],
                        r["tok_cache_write"], price_of(r["model"], rules))
         total_usd += usd
-        print(f"  {r['source']:7} {r['model']:32} sess={r['sessions']:3} "
+        mdl = r['model'].split(',')[-1].lstrip('?')
+        print(f"  {r['source']:7} {mdl:32} sess={r['sessions']:3} "
               f"msg={r['user_msgs']:4} tool={r['tool_calls']:4} "
               f"{r['lifespan_seconds']/60:6.1f}min"
               f"  in={_tok(r['tok_in'])} out={_tok(r['tok_out'])}"
@@ -1008,7 +1014,7 @@ def cmd_report(args):
             usd = cost_usd(ti or 0, to or 0, tcr or 0, 0,
                            price_of(model, rules))
             cost_s = (f" 实扣${cost:.2f}" if cost else f" ≈${usd:.2f}")
-            print(f"  {app:11} {(model or '?'):34} req={n:5} "
+            print(f"  {app:11} {((model or '?').split(',')[-1].lstrip('?')):34} req={n:5} "
                   f"in={_tok(ti)} out={_tok(to)} cr={_tok(tcr)}{cost_s}")
         real = c.execute("SELECT sum(cost_usd) FROM usage_events WHERE ts>=?",
                          (since,)).fetchone()[0]

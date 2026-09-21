@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui_plot::{Bar, BarChart, Legend, Line, Plot};
 
-use crate::{build_report, load_stats, now, open_db, paint_icon, spawn_collect, tok, Stats};
+use crate::{
+    build_report, load_stats, now, open_db, paint_icon, spawn_collect, tok, Agg, ModelRow,
+    Stats,
+};
 
 const RELOAD: Duration = Duration::from_secs(60);
 const COLLECT_DELAY: Duration = Duration::from_secs(8);
@@ -32,7 +35,7 @@ pub fn run() -> eframe::Result<()> {
     let px = paint_icon(pct, 64);
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Devin 用量")
+            .with_title("AI 用量")
             .with_inner_size([460.0, 780.0])
             .with_min_inner_size([380.0, 560.0])
             .with_icon(Arc::new(egui::IconData {
@@ -43,7 +46,7 @@ pub fn run() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Devin 用量",
+        "AI 用量",
         opts,
         Box::new(|cc| {
             load_cjk_font(&cc.egui_ctx);
@@ -113,37 +116,40 @@ struct Charts {
     daily: Vec<DayRow>,
 }
 
-/// days=0 → 全部历史
-fn load_charts(days: i64) -> Charts {
+/// days=0 → 全部历史；app="devin" 走 local_sessions，其他应用走 usage_events
+fn load_charts(days: i64, app: &str) -> Charts {
     let mut c = Charts::default();
     let Some(conn) = open_db() else { return c };
     let t0 = if days > 0 { now() - days * 86400 } else { 0 };
-    if let Ok(mut s) = conn.prepare(
-        "SELECT strftime('%m-%d %H:%M', ts, 'unixepoch', 'localtime'),
-                weekly_quota_remaining_pct
-         FROM quota_snapshots WHERE ts >= ?1 ORDER BY ts",
-    ) {
-        if let Ok(rows) =
-            s.query_map([t0], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
-        {
-            c.quota = rows.flatten().collect();
+    if app == "devin" {
+        if let Ok(mut s) = conn.prepare(
+            "SELECT strftime('%m-%d %H:%M', ts, 'unixepoch', 'localtime'),
+                    weekly_quota_remaining_pct
+             FROM quota_snapshots WHERE ts >= ?1 ORDER BY ts",
+        ) {
+            if let Ok(rows) =
+                s.query_map([t0], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+            {
+                c.quota = rows.flatten().collect();
+            }
         }
     }
     // 各列分开 sum：整行相加遇 NULL 会整行变 NULL（老会话无 metrics）
-    // devin 系走 local_sessions；cursor/antigravity 真实 token 走 usage_events
-    if let Ok(mut s) = conn.prepare(
-        "SELECT day, md, sum(tin), sum(tout), sum(tcr), sum(tcw) FROM (
-           SELECT strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') day,
-                  strftime('%m-%d', created_at, 'unixepoch', 'localtime') md,
-                  tok_in tin, tok_out tout, tok_cache_read tcr, tok_cache_write tcw
-             FROM local_sessions
-             WHERE created_at >= ?1 AND source NOT IN ('cursor','antigravity')
-           UNION ALL
-           SELECT day, substr(day,6) md, tok_in, tok_out, tok_cache_read, tok_cache_write
-             FROM usage_events WHERE ts >= ?1
-         ) GROUP BY day ORDER BY day",
-    ) {
-        if let Ok(rows) = s.query_map([t0, t0], |r| {
+    let sql = if app == "devin" {
+        "SELECT strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') day,
+                strftime('%m-%d', created_at, 'unixepoch', 'localtime') md,
+                sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
+         FROM local_sessions
+         WHERE created_at >= ?1 AND source NOT IN ('cursor','antigravity')
+         GROUP BY 1 ORDER BY 1"
+    } else {
+        "SELECT day, substr(day,6) md,
+                sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
+         FROM usage_events WHERE ts >= ?1 AND app = ?2
+         GROUP BY day ORDER BY day"
+    };
+    if let Ok(mut s) = conn.prepare(sql) {
+        let parse = |r: &rusqlite::Row| -> rusqlite::Result<DayRow> {
             Ok(DayRow {
                 ymd: r.get::<_, String>(0)?,
                 label: r.get::<_, String>(1)?,
@@ -154,7 +160,13 @@ fn load_charts(days: i64) -> Charts {
                     r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
                 ],
             })
-        }) {
+        };
+        let rows = if app == "devin" {
+            s.query_map(rusqlite::params![t0], parse).ok()
+        } else {
+            s.query_map(rusqlite::params![t0, app], parse).ok()
+        };
+        if let Some(rows) = rows {
             c.daily = rows.flatten().collect();
         }
     }
@@ -163,27 +175,34 @@ fn load_charts(days: i64) -> Charts {
 
 /// 某一天的明细：该日记录数 + 分模型行（token 降序）。
 /// devin 系按会话创建日；cursor/antigravity 按事件日（更贴近真实使用日）。
-fn load_day_detail(ymd: &str) -> (i64, Vec<(String, i64, i64, i64, i64, i64)>) {
+fn load_day_detail(
+    ymd: &str,
+    app: &str,
+) -> (i64, Vec<(String, i64, i64, i64, i64, i64)>) {
     let mut n_sess = 0i64;
     let mut rows = Vec::new();
     let Some(conn) = open_db() else {
         return (0, rows);
     };
-    if let Ok(mut s) = conn.prepare(
-        "SELECT model, cnt, msgs, tin, tout, tcr FROM (
-           SELECT model, count(*) cnt, sum(n_user) msgs,
-                  sum(tok_in) tin, sum(tok_out) tout, sum(tok_cache_read) tcr
-             FROM local_sessions
-             WHERE strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') = ?1
-               AND source NOT IN ('cursor','antigravity')
-             GROUP BY model
-           UNION ALL
-           SELECT app || '·' || model, count(*), 0,
-                  sum(tok_in), sum(tok_out), sum(tok_cache_read)
-             FROM usage_events WHERE day = ?1 GROUP BY app, model
-         ) ORDER BY ifnull(tin,0)+ifnull(tout,0)+ifnull(tcr,0) DESC",
-    ) {
-        if let Ok(it) = s.query_map([ymd, ymd], |r| {
+    let (sql, p2): (&str, Option<&str>) = if app == "devin" {
+        ("SELECT model, count(*) cnt, sum(n_user),
+                sum(tok_in), sum(tok_out), sum(tok_cache_read)
+         FROM local_sessions
+         WHERE strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') = ?1
+           AND source NOT IN ('cursor','antigravity')
+         GROUP BY model
+         ORDER BY ifnull(sum(tok_in),0)+ifnull(sum(tok_out),0)
+                  +ifnull(sum(tok_cache_read),0)+ifnull(sum(tok_cache_write),0) DESC",
+         None)
+    } else {
+        ("SELECT model, count(*), 0,
+                sum(tok_in), sum(tok_out), sum(tok_cache_read)
+         FROM usage_events WHERE day=?1 AND app=?2 GROUP BY model
+         ORDER BY sum(tok_in)+sum(tok_out)+sum(tok_cache_read) DESC",
+         Some(app))
+    };
+    if let Ok(mut s) = conn.prepare(sql) {
+        let parse = |r: &rusqlite::Row| -> rusqlite::Result<(String, i64, i64, i64, i64, i64)> {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<i64>>(1)?.unwrap_or(0),
@@ -192,7 +211,13 @@ fn load_day_detail(ymd: &str) -> (i64, Vec<(String, i64, i64, i64, i64, i64)>) {
                 r.get::<_, Option<i64>>(4)?.unwrap_or(0),
                 r.get::<_, Option<i64>>(5)?.unwrap_or(0),
             ))
-        }) {
+        };
+        let it = if let Some(a) = p2 {
+            s.query_map(rusqlite::params![ymd, a], parse).ok()
+        } else {
+            s.query_map([ymd], parse).ok()
+        };
+        if let Some(it) = it {
             for row in it.flatten() {
                 n_sess += row.1;
                 rows.push(row);
@@ -231,6 +256,7 @@ struct Panel {
     st: Stats,
     charts: Charts,
     days: i64, // 图表回看范围：7/14/30/90，0=全部
+    tab: &'static str, // "devin" | "cursor" | "antigravity" —— 各应用套餐独立
     report: String,
     logo: Option<egui::TextureHandle>,
     sel_day: Option<String>, // 图表中选中的日期（点柱子/下拉）
@@ -254,8 +280,9 @@ impl Panel {
         let report = build_report(&st);
         Self {
             st,
-            charts: load_charts(14),
+            charts: load_charts(14, "devin"),
             days: 14,
+            tab: "devin",
             report,
             logo: None,
             sel_day: None,
@@ -263,6 +290,46 @@ impl Panel {
             collecting: None,
             on_top: false,
         }
+    }
+
+    /// 当前 tab 的报告文本（devin 用完整报告，其他应用生成简版）
+    fn current_report(&self) -> String {
+        if self.tab == "devin" {
+            return self.report.clone();
+        }
+        let name = if self.tab == "cursor" {
+            "Cursor"
+        } else {
+            "Antigravity"
+        };
+        let Some(ap) = self.st.apps.get(self.tab) else {
+            return format!("{name} 暂无数据");
+        };
+        let mut s = format!(
+            "{name} 用量报告\n会话 {}（7d {}） | 请求 {}\ntoken: in {} out {} cacheR {} cacheW {}\n估算成本: 7d ${:.2} | 累计 ${:.2}\n",
+            ap.sessions_all,
+            ap.sessions_7d,
+            ap.total_all.sessions,
+            ap.total_all.tin,
+            ap.total_all.tout,
+            ap.total_all.tcr,
+            ap.total_all.tcw,
+            ap.usd_7d,
+            ap.usd_all,
+        );
+        if ap.real_usd_all > 0.0 {
+            s += &format!("订阅外实扣: ${:.2}\n", ap.real_usd_all);
+        }
+        if !ap.plan.is_empty() {
+            s += &format!("套餐: {}\n", ap.plan);
+        }
+        for m in &ap.models {
+            s += &format!(
+                "  {}·{}  req {}  in {}  out {}  cacheR {}  ~${:.4}\n",
+                m.source, m.model, m.all.sessions, m.all.tin, m.all.tout, m.all.tcr, m.usd_all
+            );
+        }
+        s
     }
 
     /// x 轴标签抽稀
@@ -444,7 +511,7 @@ impl Panel {
     /// 选中某天的明细块（分模型）
     fn day_detail(&self, ui: &mut egui::Ui) {
         let Some(ymd) = &self.sel_day else { return };
-        let (n_sess, rows) = load_day_detail(ymd);
+        let (n_sess, rows) = load_day_detail(ymd, self.tab);
         ui.add_space(4.0);
         ui.separator();
         ui.add_space(4.0);
@@ -477,8 +544,7 @@ impl Panel {
     }
 
     /// token 构成比例条（累计 in/out/缓存读/缓存写）
-    fn mix_strip(&self, ui: &mut egui::Ui) {
-        let t = &self.st.total_all;
+    fn mix_strip(&self, ui: &mut egui::Ui, t: &Agg) {
         let sum = t.tin + t.tout + t.tcr + t.tcw;
         if sum == 0 {
             return;
@@ -535,8 +601,8 @@ impl Panel {
         });
     }
 
-    /// 模型族汇总表（全部族）+ 可折叠的具体模型明细（50 个变体全列）
-    fn model_table(&self, ui: &mut egui::Ui) {
+    /// 模型族汇总表（全部族）+ 可折叠的具体模型明细
+    fn model_table(&self, ui: &mut egui::Ui, models: &[ModelRow], note: &str) {
         struct Fam {
             sessions: i64,
             tin: i64,
@@ -546,7 +612,7 @@ impl Panel {
             hours: f64,
         }
         let mut fams: BTreeMap<String, Fam> = BTreeMap::new();
-        for m in &self.st.all_models {
+        for m in models {
             let f = fams.entry(family_of(&m.model)).or_insert(Fam {
                 sessions: 0,
                 tin: 0,
@@ -589,16 +655,12 @@ impl Panel {
             });
 
         // 具体型号全列表（可折叠；型号名长，包横向滚动条）
-        egui::CollapsingHeader::new(format!("具体型号（{} 个）", self.st.all_models.len()))
+        egui::CollapsingHeader::new(format!("具体型号（{} 个）", models.len()))
             .default_open(false)
             .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "gpt-6-astra / gpt-5-6-* 等为 Devin 内部模型，无公开价，按 gpt 档折算",
-                    )
-                    .weak()
-                    .small(),
-                );
+                if !note.is_empty() {
+                    ui.label(egui::RichText::new(note).weak().small());
+                }
                 egui::ScrollArea::horizontal()
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
@@ -611,7 +673,7 @@ impl Panel {
                                     ui.label(egui::RichText::new(h).weak().small());
                                 }
                                 ui.end_row();
-                                for m in &self.st.all_models {
+                                for m in models {
                                     ui.label(
                                         egui::RichText::new(format!("{}·{}", m.source, m.model))
                                             .small(),
@@ -637,7 +699,7 @@ impl eframe::App for Panel {
                 .is_some_and(|t| t.elapsed() >= COLLECT_DELAY);
         if due {
             self.st = load_stats();
-            self.charts = load_charts(self.days);
+            self.charts = load_charts(self.days, self.tab);
             self.report = build_report(&self.st);
             self.reloaded = Instant::now();
             self.collecting = None;
@@ -657,10 +719,28 @@ impl eframe::App for Panel {
         // 底栏：等效成本 + 操作按钮（固定可见，不随内容滚动）
         egui::TopBottomPanel::bottom("actions").show(ctx, |ui| {
             ui.add_space(4.0);
-            ui.label(format!(
-                "等效成本（公开 API 价折算）: 近7天 ${:.2} · SWE-2 ${:.2} · 累计 ${:.2}",
-                self.st.usd_7d, self.st.swe2_usd_7d, self.st.usd_all
-            ));
+            match self.tab {
+                "devin" => ui.label(format!(
+                    "Devin 等效成本（公开 API 价折算）: 近7天 ${:.2} · SWE-2 ${:.2} · 累计 ${:.2}",
+                    self.st.usd_7d, self.st.swe2_usd_7d, self.st.usd_all
+                )),
+                key => {
+                    if let Some(ap) = self.st.apps.get(key) {
+                        let mut s = format!(
+                            "{} 估算成本: 近7天 ${:.2} · 累计 ${:.2}",
+                            if key == "cursor" { "Cursor" } else { "Antigravity" },
+                            ap.usd_7d,
+                            ap.usd_all
+                        );
+                        if ap.real_usd_all > 0.0 {
+                            s += &format!(" · 订阅外实扣 ${:.2}", ap.real_usd_all);
+                        }
+                        ui.label(s)
+                    } else {
+                        ui.label("暂无该应用数据")
+                    }
+                }
+            };
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let label = if self.collecting.is_some() {
@@ -676,7 +756,7 @@ impl eframe::App for Panel {
                     self.collecting = Some(Instant::now());
                 }
                 if ui.button("复制报告").clicked() {
-                    ctx.copy_text(self.report.clone());
+                    ctx.copy_text(self.current_report());
                 }
                 if ui
                     .button(if self.on_top { "取消置顶" } else { "置顶" })
@@ -701,7 +781,7 @@ impl eframe::App for Panel {
                 if let Some(t) = &self.logo {
                     ui.image((t.id(), egui::vec2(22.0, 22.0)));
                 }
-                ui.heading("Devin 用量");
+                ui.heading("AI 用量");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(format!("采集于 {}", self.st.last_collect_ago))
@@ -718,9 +798,28 @@ impl eframe::App for Panel {
                 return;
             }
 
+            // 应用切换：各应用套餐/计费独立，不混计
+            ui.horizontal(|ui| {
+                for (key, label) in [
+                    ("devin", "Devin"),
+                    ("cursor", "Cursor"),
+                    ("antigravity", "Antigravity"),
+                ] {
+                    if ui.selectable_label(self.tab == key, label).clicked()
+                        && self.tab != key
+                    {
+                        self.tab = key;
+                        self.charts = load_charts(self.days, self.tab);
+                        self.sel_day = None;
+                    }
+                }
+            });
+            ui.add_space(2.0);
+
             egui::ScrollArea::vertical().show(ui, |ui| {
-                // ---- 配额卡片
-                if let Some(q) = &self.st.quota {
+                // ---- 配额卡片（Devin 专属）
+                if self.tab == "devin" {
+                    if let Some(q) = &self.st.quota {
                     card(ui, |ui| {
                         let c = quota_color(q.weekly_pct);
                         ui.horizontal(|ui| {
@@ -756,6 +855,7 @@ impl eframe::App for Panel {
                         );
                     });
                     ui.add_space(6.0);
+                    }
                 }
 
                 // ---- 趋势卡片（含历史回看选择器）
@@ -778,23 +878,28 @@ impl eframe::App for Panel {
                                         && self.days != d
                                     {
                                         self.days = d;
-                                        self.charts = load_charts(d);
+                                        self.charts = load_charts(d, self.tab);
                                     }
                                 }
                             },
                         );
                     });
-                    ui.label(egui::RichText::new("配额剩余 %").small().weak());
-                    self.quota_plot(ui);
-                    if self.charts.quota.len() < 2 {
-                        ui.label(
-                            egui::RichText::new("快照积累中（每 15min 一条）").weak().small(),
-                        );
+                    if self.tab == "devin" {
+                        ui.label(egui::RichText::new("配额剩余 %").small().weak());
+                        self.quota_plot(ui);
+                        if self.charts.quota.len() < 2 {
+                            ui.label(
+                                egui::RichText::new("快照积累中（每 15min 一条）")
+                                    .weak()
+                                    .small(),
+                            );
+                        }
+                        ui.add_space(4.0);
                     }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("每日 token（M）· 点柱子看当日").small().weak(),
+                            egui::RichText::new("每日 token · 点柱子看当日").small().weak(),
                         );
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -837,34 +942,80 @@ impl eframe::App for Panel {
                 ui.add_space(6.0);
 
                 // ---- SWE-2 卡片（紧凑数字列，不溢出）
-                card(ui, |ui| {
-                    ui.label(egui::RichText::new("SWE-2").strong());
-                    egui::Grid::new("swe2")
-                        .num_columns(6)
-                        .spacing([10.0, 4.0])
-                        .show(ui, |ui| {
-                            for h in ["", "会话", "msg", "tool", "输出", "缓存读"] {
-                                ui.label(egui::RichText::new(h).weak().small());
-                            }
-                            ui.end_row();
-                            for (label, a) in
-                                [("近7天", &self.st.swe2_7d), ("累计", &self.st.swe2_all)]
-                            {
-                                ui.label(label);
-                                ui.monospace(format!("{}", a.sessions));
-                                ui.monospace(format!("{}", a.msgs));
-                                ui.monospace(format!("{}", a.tools));
-                                ui.monospace(tok_zh(a.tout));
-                                ui.monospace(tok_zh(a.tcr));
+                if self.tab == "devin" {
+                    card(ui, |ui| {
+                        ui.label(egui::RichText::new("SWE-2").strong());
+                        egui::Grid::new("swe2")
+                            .num_columns(6)
+                            .spacing([10.0, 4.0])
+                            .show(ui, |ui| {
+                                for h in ["", "会话", "msg", "tool", "输出", "缓存读"] {
+                                    ui.label(egui::RichText::new(h).weak().small());
+                                }
                                 ui.end_row();
-                            }
-                        });
-                });
-                ui.add_space(6.0);
+                                for (label, a) in
+                                    [("近7天", &self.st.swe2_7d), ("累计", &self.st.swe2_all)]
+                                {
+                                    ui.label(label);
+                                    ui.monospace(format!("{}", a.sessions));
+                                    ui.monospace(format!("{}", a.msgs));
+                                    ui.monospace(format!("{}", a.tools));
+                                    ui.monospace(tok_zh(a.tout));
+                                    ui.monospace(tok_zh(a.tcr));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                    ui.add_space(6.0);
+                }
 
-                // ---- Token 构成卡片
+                // ---- 非 Devin 应用概要卡（会话数 + 套餐 + 附加指标）
+                if self.tab != "devin" {
+                    card(ui, |ui| {
+                        if let Some(ap) = self.st.apps.get(self.tab) {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("用量概要").strong());
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if !ap.plan.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "套餐 {}",
+                                                    ap.plan
+                                                ))
+                                                .weak()
+                                                .small(),
+                                            );
+                                        }
+                                    },
+                                );
+                            });
+                            ui.label(format!(
+                                "会话 {}（7d {}）· 请求 {}",
+                                ap.sessions_all, ap.sessions_7d, ap.total_all.sessions
+                            ));
+                            if !ap.extra.is_empty() {
+                                ui.label(egui::RichText::new(&ap.extra).weak().small());
+                            }
+                        } else {
+                            ui.label("暂无该应用的数据 — 先跑一次 collect");
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
+
+                // ---- Token 构成卡片（按当前应用）
                 card(ui, |ui| {
-                    let t = &self.st.total_all;
+                    let t = match self.tab {
+                        "devin" => &self.st.total_all,
+                        key => self
+                            .st
+                            .apps
+                            .get(key)
+                            .map(|a| &a.total_all)
+                            .unwrap_or(&self.st.total_all),
+                    };
                     let sum = t.tin + t.tout + t.tcr + t.tcw;
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Token 构成").strong());
@@ -878,29 +1029,55 @@ impl eframe::App for Panel {
                             },
                         );
                     });
-                    self.mix_strip(ui);
+                    self.mix_strip(ui, t);
                 });
                 ui.add_space(6.0);
 
-                // ---- 模型族卡片
+                // ---- 模型族卡片（按当前应用）
                 card(ui, |ui| {
+                    let (models, note): (&[ModelRow], &str) = match self.tab {
+                        "devin" => (
+                            &self.st.all_models,
+                            "gpt-6-astra / gpt-5-6-* 等为 Devin 内部模型，无公开价，按 gpt 档折算",
+                        ),
+                        "cursor" => (
+                            self.st
+                                .apps
+                                .get("cursor")
+                                .map(|a| a.models.as_slice())
+                                .unwrap_or(&[]),
+                            "Cost=Included 为订阅内用量；估算按 API 刊例价折算",
+                        ),
+                        _ => (
+                            self.st
+                                .apps
+                                .get("antigravity")
+                                .map(|a| a.models.as_slice())
+                                .unwrap_or(&[]),
+                            "本地生成记录的 token 统计；按模型 API 价折算",
+                        ),
+                    };
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("模型族（全部模型）").strong());
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
                                 ui.label(
-                                    egui::RichText::new(format!(
-                                        "共 {} 个模型",
-                                        self.st.all_models.len()
-                                    ))
-                                    .weak()
-                                    .small(),
+                                    egui::RichText::new(format!("共 {} 个模型", models.len()))
+                                        .weak()
+                                        .small(),
                                 );
                             },
                         );
                     });
-                    self.model_table(ui);
+                    if models.is_empty() {
+                        ui.label(
+                            egui::RichText::new("暂无该应用的模型记录 — 先跑一次 collect")
+                                .weak(),
+                        );
+                    } else {
+                        self.model_table(ui, models, note);
+                    }
                 });
                 ui.add_space(6.0);
             });

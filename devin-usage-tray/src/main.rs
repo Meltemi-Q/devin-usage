@@ -42,7 +42,25 @@ pub struct Stats {
     pub last_collect_ago: String,
     pub has_db: bool,
     /// 全模型行（面板表格用；per_model 仍是 swe-2 专供托盘菜单）
+    /// 口径：仅 devin 系（app/cli/unknown 源），其他应用走 apps
     pub all_models: Vec<ModelRow>,
+    /// 其他应用独立统计（套餐各自独立，不混入 devin 数字）
+    pub apps: std::collections::BTreeMap<String, AppStats>,
+}
+
+#[derive(Default)]
+pub struct AppStats {
+    pub total_7d: Agg,
+    pub total_all: Agg,
+    pub usd_7d: f64,
+    pub usd_all: f64,
+    pub real_usd_7d: f64,  // 服务端实扣（cursor 订阅外消耗）
+    pub real_usd_all: f64,
+    pub models: Vec<ModelRow>,
+    pub sessions_7d: i64,
+    pub sessions_all: i64,
+    pub plan: String,      // 如 cursor 的 ultra
+    pub extra: String,     // 附加说明行（如 tab 采纳行数）
 }
 
 pub struct Quota {
@@ -239,66 +257,27 @@ pub fn load_stats() -> Stats {
             |r| agg(r, 0),
         )
         .unwrap_or_default();
+    // devin 系总计（排除 cursor/antigravity——各应用套餐独立，不混计）
+    const DEVIN_SRC: &str = "source NOT IN ('cursor','antigravity')";
     st.total_7d = conn
-        .query_row(&format!("{SEL} WHERE created_at>=?1"), [t7], |r| {
-            agg(r, 0)
-        })
+        .query_row(
+            &format!("{SEL} WHERE {DEVIN_SRC} AND created_at>=?1"),
+            [t7],
+            |r| agg(r, 0),
+        )
         .unwrap_or_default();
     st.total_all = conn
-        .query_row(SEL, [], |r| agg(r, 0))
+        .query_row(&format!("{SEL} WHERE {DEVIN_SRC}"), [], |r| agg(r, 0))
         .unwrap_or_default();
-
-    // token 总额口径：devin 系会话读 local_sessions；cursor/antigravity 的
-    // 真实 token 在 usage_events（其会话行 tok_* 是副本，不参与汇总，避免双计）
-    const SELT: &str = "SELECT sum(tok_in),sum(tok_out),sum(tok_cache_read),sum(tok_cache_write)
-                        FROM local_sessions WHERE source NOT IN ('cursor','antigravity')";
-    const SELE: &str = "SELECT sum(tok_in),sum(tok_out),sum(tok_cache_read),sum(tok_cache_write)
-                        FROM usage_events";
-    for (dst, since) in [
-        (&mut st.total_all, None),
-        (&mut st.total_7d, Some(t7)),
-    ] as [(&mut Agg, Option<i64>); 2] {
-        let mut sums = [0i64; 4];
-        for (sql, filtered) in [(SELT, true), (SELE, false)] {
-            // sessions 按 created_at 过滤，events 按 ts 过滤
-            let q = match (since, filtered) {
-                (Some(_), true) => format!("{sql} AND created_at>=?1"),
-                (Some(_), false) => format!("{sql} WHERE ts>=?1"),
-                (None, _) => sql.to_string(),
-            };
-            let res = if let Some(t) = since {
-                conn.query_row(&q, [t], |r| {
-                    Ok([0usize, 1, 2, 3].map(|i| {
-                        r.get::<_, Option<i64>>(i).unwrap_or_default().unwrap_or(0)
-                    }))
-                })
-            } else {
-                conn.query_row(&q, [], |r| {
-                    Ok([0usize, 1, 2, 3].map(|i| {
-                        r.get::<_, Option<i64>>(i).unwrap_or_default().unwrap_or(0)
-                    }))
-                })
-            };
-            if let Ok(v) = res {
-                for i in 0..4 {
-                    sums[i] += v[i];
-                }
-            }
-        }
-        dst.tin = sums[0];
-        dst.tout = sums[1];
-        dst.tcr = sums[2];
-        dst.tcw = sums[3];
-    }
 
     // 等效成本：db 里的 model_prices 规则表（首个 prefix 命中）
     let rules = load_prices(&conn);
     st.swe2_usd_7d = cost(&st.swe2_7d, price_of("swe-2", &rules));
     st.swe2_usd_all = cost(&st.swe2_all, price_of("swe-2", &rules));
-    // 全模型成本：逐模型行按各自价格累计
+    // 全模型成本：逐模型行按各自价格累计（仅 devin 系）
     for (sql, args, dst) in [
-        (format!("{SELM} GROUP BY model"), vec![], &mut st.usd_all),
-        (format!("{SELM} WHERE created_at>=?1 GROUP BY model"), vec![t7], &mut st.usd_7d),
+        (format!("{SELM} WHERE {DEVIN_SRC} GROUP BY model"), vec![], &mut st.usd_all),
+        (format!("{SELM} WHERE {DEVIN_SRC} AND created_at>=?1 GROUP BY model"), vec![t7], &mut st.usd_7d),
     ] {
         if let Ok(mut s) = conn.prepare(&sql) {
             if let Ok(rows) = s.query_map(rusqlite::params_from_iter(args), |r| {
@@ -378,93 +357,9 @@ pub fn load_stats() -> Stats {
             }
         }
     }
-    // 事件账本侧：cursor/antigravity 按 (app,model) 汇总，"会话"列显示请求数
-    for (sql, arg, is7d) in [
-        ("SELECT app, model, count(*), sum(tok_in), sum(tok_out), sum(tok_cache_read),
-                  sum(tok_cache_write), sum(cost_usd)
-          FROM usage_events GROUP BY app, model", None, false),
-        ("SELECT app, model, count(*), sum(tok_in), sum(tok_out), sum(tok_cache_read),
-                  sum(tok_cache_write), sum(cost_usd)
-          FROM usage_events WHERE ts>=?1 GROUP BY app, model", Some(t7), true),
-    ] {
-        if let Ok(mut stmt) = conn.prepare(sql) {
-            let map = |r: &rusqlite::Row| -> rusqlite::Result<(String, String, Agg, f64)> {
-                let mut a = Agg::default();
-                a.sessions = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
-                a.tin = r.get::<_, Option<i64>>(3)?.unwrap_or(0);
-                a.tout = r.get::<_, Option<i64>>(4)?.unwrap_or(0);
-                a.tcr = r.get::<_, Option<i64>>(5)?.unwrap_or(0);
-                a.tcw = r.get::<_, Option<i64>>(6)?.unwrap_or(0);
-                Ok((
-                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    a,
-                    r.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
-                ))
-            };
-            let it = if let Some(t) = arg {
-                stmt.query_map([t], map).ok()
-            } else {
-                stmt.query_map([], map).ok()
-            };
-            if let Some(rows) = it {
-                for (src, mdl, a, real_cost) in rows.flatten() {
-                    let est = cost(&a, price_of(&mdl, &rules));
-                    let usd = if real_cost > 0.0 { real_cost } else { est };
-                    if is7d {
-                        if let Some(m) = st
-                            .all_models
-                            .iter_mut()
-                            .find(|m| m.model == mdl && m.source == src)
-                        {
-                            m.d7 = a;
-                            m.usd_7d = usd;
-                        }
-                    } else {
-                        st.all_models.push(ModelRow {
-                            source: src,
-                            model: mdl,
-                            all: a,
-                            d7: Agg::default(),
-                            usd_all: usd,
-                            usd_7d: 0.0,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    // 事件侧成本并进等效成本总额（真实 cost_usd 优先，Included 用刊例价折算）
-    for (dst, since) in [(&mut st.usd_all, 0i64), (&mut st.usd_7d, t7)] {
-        if let Ok(mut s) = conn.prepare(
-            "SELECT model, sum(tok_in), sum(tok_out), sum(tok_cache_read),
-                    sum(tok_cache_write), sum(cost_usd)
-             FROM usage_events WHERE ts>=?1 GROUP BY model",
-        ) {
-            if let Ok(rows) = s.query_map([since], |r| {
-                Ok((
-                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    r.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                    r.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                    r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-                ))
-            }) {
-                for (mdl, i, o, cr, cw, real) in rows.flatten() {
-                    let mut a = Agg::default();
-                    a.tin = i;
-                    a.tout = o;
-                    a.tcr = cr;
-                    a.tcw = cw;
-                    *dst += if real > 0.0 {
-                        real
-                    } else {
-                        cost(&a, price_of(&mdl, &rules))
-                    };
-                }
-            }
-        }
+    // 其他应用：独立统计（各应用套餐独立，绝不混入 devin 数字）
+    for app in ["cursor", "antigravity"] {
+        st.apps.insert(app.to_string(), load_app_stats(&conn, app, t7, &rules));
     }
     if let Ok(mut stmt) =
         conn.prepare(&format!("{SELSM} WHERE source NOT IN ('cursor','antigravity') AND created_at>=?1 GROUP BY source, model"))
@@ -489,6 +384,179 @@ pub fn load_stats() -> Stats {
         }
     }
     st
+}
+
+/// 其他应用（cursor/antigravity）独立统计：
+/// token 账本=usage_events（真实口径），会话数=local_sessions(source=app)
+fn load_app_stats(
+    conn: &Connection,
+    app: &str,
+    t7: i64,
+    rules: &[(String, PriceRule)],
+) -> AppStats {
+    let mut a = AppStats::default();
+    a.sessions_all = conn
+        .query_row(
+            "SELECT count(*) FROM local_sessions WHERE source=?1",
+            [app],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    a.sessions_7d = conn
+        .query_row(
+            "SELECT count(*) FROM local_sessions WHERE source=?1 AND created_at>=?2",
+            rusqlite::params![app, t7],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    for (all, since) in [(true, 0i64), (false, t7)] {
+        let row = conn.query_row(
+            "SELECT count(*), sum(tok_in), sum(tok_out), sum(tok_cache_read),
+                    sum(tok_cache_write), sum(cost_usd)
+             FROM usage_events WHERE app=?1 AND ts>=?2",
+            rusqlite::params![app, since],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                ))
+            },
+        );
+        if let Ok((n, i, o, cr, cw, rc)) = row {
+            let (dst, real) = if all {
+                (&mut a.total_all, &mut a.real_usd_all)
+            } else {
+                (&mut a.total_7d, &mut a.real_usd_7d)
+            };
+            dst.sessions += n; // 应用页"会话"列口径=请求数
+            dst.tin = i;
+            dst.tout = o;
+            dst.tcr = cr;
+            dst.tcw = cw;
+            *real = rc;
+        }
+    }
+    // 每模型明细（all + 7d 各一遍）
+    for (is7d, since) in [(false, 0i64), (true, t7)] {
+        if let Ok(mut s) = conn.prepare(
+            "SELECT model, count(*), sum(tok_in), sum(tok_out), sum(tok_cache_read),
+                    sum(tok_cache_write), sum(cost_usd)
+             FROM usage_events WHERE app=?1 AND ts>=?2 GROUP BY model
+             ORDER BY 3 DESC",
+        ) {
+            if let Ok(rows) = s.query_map(rusqlite::params![app, since], |r| {
+                let mut ag = Agg::default();
+                ag.sessions = r.get::<_, Option<i64>>(1)?.unwrap_or(0);
+                ag.tin = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
+                ag.tout = r.get::<_, Option<i64>>(3)?.unwrap_or(0);
+                ag.tcr = r.get::<_, Option<i64>>(4)?.unwrap_or(0);
+                ag.tcw = r.get::<_, Option<i64>>(5)?.unwrap_or(0);
+                Ok((
+                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    ag,
+                    r.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                ))
+            }) {
+                for (mdl, ag, rc) in rows.flatten() {
+                    // antigravity 偶有多模型合并串 "?,gemini-3.8-flash" —— 取末段
+                    let mdl = mdl
+                        .rsplit(',')
+                        .next()
+                        .unwrap_or(&mdl)
+                        .trim_start_matches('?')
+                        .to_string();
+                    let usd = if rc > 0.0 {
+                        rc
+                    } else {
+                        cost(&ag, price_of(&mdl, rules))
+                    };
+                    if is7d {
+                        if let Some(m) = a.models.iter_mut().find(|m| m.model == mdl) {
+                            m.d7.sessions += ag.sessions;
+                            m.d7.msgs += ag.msgs;
+                            m.d7.tools += ag.tools;
+                            m.d7.hours += ag.hours;
+                            m.d7.tin += ag.tin;
+                            m.d7.tout += ag.tout;
+                            m.d7.tcr += ag.tcr;
+                            m.d7.tcw += ag.tcw;
+                            m.usd_7d += usd;
+                        }
+                    } else if let Some(m) =
+                        a.models.iter_mut().find(|m| m.model == mdl)
+                    {
+                        // 规范化后重名的变体合并进同一行
+                        m.all.sessions += ag.sessions;
+                        m.all.msgs += ag.msgs;
+                        m.all.tools += ag.tools;
+                        m.all.hours += ag.hours;
+                        m.all.tin += ag.tin;
+                        m.all.tout += ag.tout;
+                        m.all.tcr += ag.tcr;
+                        m.all.tcw += ag.tcw;
+                        m.usd_all += usd;
+                    } else {
+                        a.models.push(ModelRow {
+                            source: app.to_string(),
+                            model: mdl,
+                            all: ag,
+                            d7: Agg::default(),
+                            usd_all: usd,
+                            usd_7d: 0.0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // 估算成本：优先服务端实扣，否则按每模型行求和（各模型价不同，不能拿单一规则套总量）
+    a.usd_all = if a.real_usd_all > 0.0 {
+        a.real_usd_all
+    } else {
+        a.models.iter().map(|m| m.usd_all).sum()
+    };
+    a.usd_7d = if a.real_usd_7d > 0.0 {
+        a.real_usd_7d
+    } else {
+        a.models.iter().map(|m| m.usd_7d).sum()
+    };
+    // 附加信息：cursor 套餐 + tab/composer 采纳行数
+    if let Ok(plan) = conn.query_row(
+        "SELECT value FROM kv WHERE key='cursor.plan'",
+        [],
+        |r| r.get::<_, String>(0),
+    ) {
+        a.plan = plan;
+    }
+    if app == "cursor" {
+        let day7: String = conn
+            .query_row("SELECT date(?1,'unixepoch','localtime')", [t7], |r| {
+                r.get(0)
+            })
+            .unwrap_or_default();
+        let mut s = String::new();
+        for (metric, label) in
+            [("tabAcceptedLines", "tab"), ("composerAcceptedLines", "composer")]
+        {
+            let v: i64 = conn
+                .query_row(
+                    "SELECT sum(value) FROM daily_activity
+                     WHERE app='cursor' AND metric=?1 AND day>=?2",
+                    rusqlite::params![metric, day7],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if v > 0 {
+                s += &format!("{label} 采纳 {v} 行/7d  ");
+            }
+        }
+        a.extra = s;
+    }
+    a
 }
 
 // ---------------------------------------------------------------- 图标
