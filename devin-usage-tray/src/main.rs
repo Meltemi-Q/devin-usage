@@ -248,6 +248,49 @@ pub fn load_stats() -> Stats {
         .query_row(SEL, [], |r| agg(r, 0))
         .unwrap_or_default();
 
+    // token 总额口径：devin 系会话读 local_sessions；cursor/antigravity 的
+    // 真实 token 在 usage_events（其会话行 tok_* 是副本，不参与汇总，避免双计）
+    const SELT: &str = "SELECT sum(tok_in),sum(tok_out),sum(tok_cache_read),sum(tok_cache_write)
+                        FROM local_sessions WHERE source NOT IN ('cursor','antigravity')";
+    const SELE: &str = "SELECT sum(tok_in),sum(tok_out),sum(tok_cache_read),sum(tok_cache_write)
+                        FROM usage_events";
+    for (dst, since) in [
+        (&mut st.total_all, None),
+        (&mut st.total_7d, Some(t7)),
+    ] as [(&mut Agg, Option<i64>); 2] {
+        let mut sums = [0i64; 4];
+        for (sql, filtered) in [(SELT, true), (SELE, false)] {
+            // sessions 按 created_at 过滤，events 按 ts 过滤
+            let q = match (since, filtered) {
+                (Some(_), true) => format!("{sql} AND created_at>=?1"),
+                (Some(_), false) => format!("{sql} WHERE ts>=?1"),
+                (None, _) => sql.to_string(),
+            };
+            let res = if let Some(t) = since {
+                conn.query_row(&q, [t], |r| {
+                    Ok([0usize, 1, 2, 3].map(|i| {
+                        r.get::<_, Option<i64>>(i).unwrap_or_default().unwrap_or(0)
+                    }))
+                })
+            } else {
+                conn.query_row(&q, [], |r| {
+                    Ok([0usize, 1, 2, 3].map(|i| {
+                        r.get::<_, Option<i64>>(i).unwrap_or_default().unwrap_or(0)
+                    }))
+                })
+            };
+            if let Ok(v) = res {
+                for i in 0..4 {
+                    sums[i] += v[i];
+                }
+            }
+        }
+        dst.tin = sums[0];
+        dst.tout = sums[1];
+        dst.tcr = sums[2];
+        dst.tcw = sums[3];
+    }
+
     // 等效成本：db 里的 model_prices 规则表（首个 prefix 命中）
     let rules = load_prices(&conn);
     st.swe2_usd_7d = cost(&st.swe2_7d, price_of("swe-2", &rules));
@@ -312,7 +355,7 @@ pub fn load_stats() -> Stats {
                         sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
                         FROM local_sessions";
     if let Ok(mut stmt) = conn.prepare(&format!(
-        "{SELSM} GROUP BY source, model
+        "{SELSM} WHERE source NOT IN ('cursor','antigravity') GROUP BY source, model
          ORDER BY sum(ifnull(tok_in,0)+ifnull(tok_out,0)+ifnull(tok_cache_read,0)+ifnull(tok_cache_write,0)) DESC
          LIMIT 200"
     )) {
@@ -335,8 +378,96 @@ pub fn load_stats() -> Stats {
             }
         }
     }
+    // 事件账本侧：cursor/antigravity 按 (app,model) 汇总，"会话"列显示请求数
+    for (sql, arg, is7d) in [
+        ("SELECT app, model, count(*), sum(tok_in), sum(tok_out), sum(tok_cache_read),
+                  sum(tok_cache_write), sum(cost_usd)
+          FROM usage_events GROUP BY app, model", None, false),
+        ("SELECT app, model, count(*), sum(tok_in), sum(tok_out), sum(tok_cache_read),
+                  sum(tok_cache_write), sum(cost_usd)
+          FROM usage_events WHERE ts>=?1 GROUP BY app, model", Some(t7), true),
+    ] {
+        if let Ok(mut stmt) = conn.prepare(sql) {
+            let map = |r: &rusqlite::Row| -> rusqlite::Result<(String, String, Agg, f64)> {
+                let mut a = Agg::default();
+                a.sessions = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
+                a.tin = r.get::<_, Option<i64>>(3)?.unwrap_or(0);
+                a.tout = r.get::<_, Option<i64>>(4)?.unwrap_or(0);
+                a.tcr = r.get::<_, Option<i64>>(5)?.unwrap_or(0);
+                a.tcw = r.get::<_, Option<i64>>(6)?.unwrap_or(0);
+                Ok((
+                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    a,
+                    r.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                ))
+            };
+            let it = if let Some(t) = arg {
+                stmt.query_map([t], map).ok()
+            } else {
+                stmt.query_map([], map).ok()
+            };
+            if let Some(rows) = it {
+                for (src, mdl, a, real_cost) in rows.flatten() {
+                    let est = cost(&a, price_of(&mdl, &rules));
+                    let usd = if real_cost > 0.0 { real_cost } else { est };
+                    if is7d {
+                        if let Some(m) = st
+                            .all_models
+                            .iter_mut()
+                            .find(|m| m.model == mdl && m.source == src)
+                        {
+                            m.d7 = a;
+                            m.usd_7d = usd;
+                        }
+                    } else {
+                        st.all_models.push(ModelRow {
+                            source: src,
+                            model: mdl,
+                            all: a,
+                            d7: Agg::default(),
+                            usd_all: usd,
+                            usd_7d: 0.0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // 事件侧成本并进等效成本总额（真实 cost_usd 优先，Included 用刊例价折算）
+    for (dst, since) in [(&mut st.usd_all, 0i64), (&mut st.usd_7d, t7)] {
+        if let Ok(mut s) = conn.prepare(
+            "SELECT model, sum(tok_in), sum(tok_out), sum(tok_cache_read),
+                    sum(tok_cache_write), sum(cost_usd)
+             FROM usage_events WHERE ts>=?1 GROUP BY model",
+        ) {
+            if let Ok(rows) = s.query_map([since], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+                ))
+            }) {
+                for (mdl, i, o, cr, cw, real) in rows.flatten() {
+                    let mut a = Agg::default();
+                    a.tin = i;
+                    a.tout = o;
+                    a.tcr = cr;
+                    a.tcw = cw;
+                    *dst += if real > 0.0 {
+                        real
+                    } else {
+                        cost(&a, price_of(&mdl, &rules))
+                    };
+                }
+            }
+        }
+    }
     if let Ok(mut stmt) =
-        conn.prepare(&format!("{SELSM} WHERE created_at>=?1 GROUP BY source, model"))
+        conn.prepare(&format!("{SELSM} WHERE source NOT IN ('cursor','antigravity') AND created_at>=?1 GROUP BY source, model"))
     {
         if let Ok(rows) = stmt.query_map([t7], |r| {
             Ok((

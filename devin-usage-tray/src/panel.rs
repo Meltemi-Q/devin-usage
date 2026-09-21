@@ -130,13 +130,20 @@ fn load_charts(days: i64) -> Charts {
         }
     }
     // 各列分开 sum：整行相加遇 NULL 会整行变 NULL（老会话无 metrics）
+    // devin 系走 local_sessions；cursor/antigravity 真实 token 走 usage_events
     if let Ok(mut s) = conn.prepare(
-        "SELECT strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime'),
-                strftime('%m-%d', created_at, 'unixepoch', 'localtime'),
-                sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
-         FROM local_sessions WHERE created_at >= ?1 GROUP BY 1 ORDER BY 1",
+        "SELECT day, md, sum(tin), sum(tout), sum(tcr), sum(tcw) FROM (
+           SELECT strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') day,
+                  strftime('%m-%d', created_at, 'unixepoch', 'localtime') md,
+                  tok_in tin, tok_out tout, tok_cache_read tcr, tok_cache_write tcw
+             FROM local_sessions
+             WHERE created_at >= ?1 AND source NOT IN ('cursor','antigravity')
+           UNION ALL
+           SELECT day, substr(day,6) md, tok_in, tok_out, tok_cache_read, tok_cache_write
+             FROM usage_events WHERE ts >= ?1
+         ) GROUP BY day ORDER BY day",
     ) {
-        if let Ok(rows) = s.query_map([t0], |r| {
+        if let Ok(rows) = s.query_map([t0, t0], |r| {
             Ok(DayRow {
                 ymd: r.get::<_, String>(0)?,
                 label: r.get::<_, String>(1)?,
@@ -154,7 +161,8 @@ fn load_charts(days: i64) -> Charts {
     c
 }
 
-/// 某一天的明细：该日总会话数 + 分模型行（token 降序）
+/// 某一天的明细：该日记录数 + 分模型行（token 降序）。
+/// devin 系按会话创建日；cursor/antigravity 按事件日（更贴近真实使用日）。
 fn load_day_detail(ymd: &str) -> (i64, Vec<(String, i64, i64, i64, i64, i64)>) {
     let mut n_sess = 0i64;
     let mut rows = Vec::new();
@@ -162,15 +170,20 @@ fn load_day_detail(ymd: &str) -> (i64, Vec<(String, i64, i64, i64, i64, i64)>) {
         return (0, rows);
     };
     if let Ok(mut s) = conn.prepare(
-        "SELECT model, count(*), sum(n_user),
-                sum(tok_in), sum(tok_out), sum(tok_cache_read)
-         FROM local_sessions
-         WHERE strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') = ?1
-         GROUP BY model
-         ORDER BY ifnull(sum(tok_in),0)+ifnull(sum(tok_out),0)
-                  +ifnull(sum(tok_cache_read),0)+ifnull(sum(tok_cache_write),0) DESC",
+        "SELECT model, cnt, msgs, tin, tout, tcr FROM (
+           SELECT model, count(*) cnt, sum(n_user) msgs,
+                  sum(tok_in) tin, sum(tok_out) tout, sum(tok_cache_read) tcr
+             FROM local_sessions
+             WHERE strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') = ?1
+               AND source NOT IN ('cursor','antigravity')
+             GROUP BY model
+           UNION ALL
+           SELECT app || '·' || model, count(*), 0,
+                  sum(tok_in), sum(tok_out), sum(tok_cache_read)
+             FROM usage_events WHERE day = ?1 GROUP BY app, model
+         ) ORDER BY ifnull(tin,0)+ifnull(tout,0)+ifnull(tcr,0) DESC",
     ) {
-        if let Ok(it) = s.query_map([ymd], |r| {
+        if let Ok(it) = s.query_map([ymd, ymd], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<i64>>(1)?.unwrap_or(0),
@@ -388,7 +401,7 @@ impl Panel {
         ui.separator();
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new(format!("{} · {} 个会话", ymd, n_sess)).strong(),
+            egui::RichText::new(format!("{} · {} 条记录", ymd, n_sess)).strong(),
         );
         if rows.is_empty() {
             ui.label(egui::RichText::new("当日无会话").weak().small());
@@ -546,7 +559,7 @@ impl Panel {
                             .spacing([10.0, 3.0])
                             .striped(true)
                             .show(ui, |ui| {
-                                for h in ["型号", "会话", "输入", "输出", "缓存读", "≈$"] {
+                                for h in ["型号", "会话/请求", "输入", "输出", "缓存读", "≈$"] {
                                     ui.label(egui::RichText::new(h).weak().small());
                                 }
                                 ui.end_row();

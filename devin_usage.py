@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -154,8 +155,32 @@ CREATE TABLE IF NOT EXISTS model_prices (
 CREATE TABLE IF NOT EXISTS collect_runs (
   ts INTEGER, source TEXT, status TEXT, detail TEXT
 );
+-- 事件级用量账本：Cursor CSV(真实计费口径) + Antigravity gen_metadata(本地真实计数)
+CREATE TABLE IF NOT EXISTS usage_events (
+  app TEXT NOT NULL,              -- 'cursor' | 'antigravity' | ...
+  event_key TEXT NOT NULL,
+  ts INTEGER NOT NULL,            -- unix 秒
+  day TEXT NOT NULL,              -- 本地 YYYY-MM-DD
+  model TEXT,
+  kind TEXT,                      -- cursor: Included/On-demand...; antigravity: 'gen'
+  session_id TEXT,                -- 可关联的会话/trajectory id
+  tok_in INTEGER DEFAULT 0, tok_out INTEGER DEFAULT 0,
+  tok_cache_read INTEGER DEFAULT 0, tok_cache_write INTEGER DEFAULT 0,
+  cost_usd REAL,                  -- CSV 真实扣费；Included 为 NULL
+  meta TEXT,                      -- json 附加
+  PRIMARY KEY(app, event_key)
+);
+-- 每日活动量（Cursor tab/composer 行数等，非 token 指标）
+CREATE TABLE IF NOT EXISTS daily_activity (
+  app TEXT NOT NULL, day TEXT NOT NULL, metric TEXT NOT NULL, value INTEGER,
+  PRIMARY KEY(app, day, metric)
+);
+-- 自有 kv：存放刷新后的 cursor access token 等（不改对方库）
+CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
 CREATE INDEX IF NOT EXISTS idx_local_created ON local_sessions(created_at);
 CREATE INDEX IF NOT EXISTS idx_cloud_created ON cloud_sessions(created_at);
+CREATE INDEX IF NOT EXISTS idx_events_day ON usage_events(day);
+CREATE INDEX IF NOT EXISTS idx_events_model ON usage_events(app, model);
 """
 
 
@@ -352,6 +377,395 @@ def collect_local(c):
     return n
 
 
+# ---------------------------------------------------------------- cursor
+
+CURSOR_EXPORT_URL = "https://cursor.com/api/dashboard/export-usage-events-csv"
+CURSOR_REFRESH_URL = "https://api2.cursor.sh/oauth/token"
+CURSOR_CLIENT_ID = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"   # Cursor 官方公开 client_id
+
+
+def _cursor_state_db() -> Path:
+    if IS_MAC:
+        return Path.home() / "Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+    if IS_WIN:
+        return APPDATA / "Cursor/User/globalStorage/state.vscdb"
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    return xdg / "Cursor/User/globalStorage/state.vscdb"
+
+
+def _jwt_payload(tok: str) -> dict:
+    try:
+        part = tok.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return json.loads(base64.urlsafe_b64decode(part))
+    except Exception:
+        return {}
+
+
+def _cursor_item(key: str) -> "str | None":
+    """从 Cursor state.vscdb ItemTable 读一个值（只读）。"""
+    dbp = _cursor_state_db()
+    try:
+        con = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
+        con.execute("PRAGMA query_only=1")
+        row = con.execute("SELECT value FROM ItemTable WHERE key=?", (key,)).fetchone()
+        con.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def cursor_access_token(c) -> "str | None":
+    """kv 里刷新过的 token 优先；否则读 Cursor 自己的 ItemTable。
+    临期/过期时用 refreshToken 换新（结果只写自己的 kv，不动 Cursor 的库）。"""
+    tok = c.execute("SELECT value FROM kv WHERE key='cursor.access'").fetchone()
+    rt = c.execute("SELECT value FROM kv WHERE key='cursor.refresh'").fetchone()
+    access, refresh = (tok and tok[0]), (rt and rt[0])
+    if not access:
+        access = _cursor_item("cursorAuth/accessToken")
+        refresh = _cursor_item("cursorAuth/refreshToken") or refresh
+    if not access and not refresh:
+        return None
+    exp = _jwt_payload(access).get("exp", 0) if access else 0
+    if exp - time.time() > 300:          # 还有 >5min，直接用
+        return access
+    if not refresh:
+        return access                    # 过期但没 refresh，先凑合
+    try:
+        req = urllib.request.Request(
+            CURSOR_REFRESH_URL, method="POST",
+            data=json.dumps({"grant_type": "refresh_token",
+                             "client_id": CURSOR_CLIENT_ID,
+                             "refresh_token": refresh}).encode(),
+            headers={"Content-Type": "application/json", "User-Agent": UA})
+        r = json.loads(urllib.request.urlopen(req, timeout=20).read())
+        new_tok = r.get("access_token")
+        if new_tok:
+            c.execute("INSERT OR REPLACE INTO kv VALUES('cursor.access',?)", (new_tok,))
+            if r.get("refresh_token"):
+                c.execute("INSERT OR REPLACE INTO kv VALUES('cursor.refresh',?)",
+                          (r["refresh_token"],))
+            return new_tok
+    except Exception:
+        pass
+    return access
+
+
+def _collect_cursor_csv(c, token) -> int:
+    """服务端 CSV 导出 → usage_events（真实 token + 真实 Cost 列）。"""
+    import csv
+    import hashlib
+    import io
+    pay = _jwt_payload(token)
+    uid = (pay.get("sub") or "").split("|")[-1]
+    if not uid:
+        raise RuntimeError("cursor JWT 无 sub")
+    end = int(time.time() * 1000)
+    start = end - 60 * 86400 * 1000       # 滚动 60 天窗口，INSERT OR IGNORE 去重
+    url = (f"{CURSOR_EXPORT_URL}?startDate={start}&endDate={end}&strategy=tokens")
+    req = urllib.request.Request(url, headers={
+        "Cookie": f"WorkosCursorSessionToken={uid}%3A%3A{token}",
+        "Accept": "text/csv", "User-Agent": UA})
+    body = urllib.request.urlopen(req, timeout=40).read().decode("utf-8", "replace")
+    if not body.startswith("Date"):
+        raise RuntimeError(f"CSV 响应异常: {body[:80]}")
+    seen = {}
+    n = 0
+    for row in csv.DictReader(io.StringIO(body)):
+        def gi(col):
+            try:
+                return int((row.get(col) or "0").replace(",", "").strip() or 0)
+            except ValueError:
+                return 0
+        canon = "|".join(str(row.get(k, "")) for k in
+                         ("Date", "Kind", "Model", "Max Mode", "Input (w/ Cache Write)",
+                          "Input (w/o Cache Write)", "Cache Read", "Output Tokens"))
+        h = hashlib.sha1(canon.encode()).hexdigest()[:16]
+        seen[h] = seen.get(h, 0) + 1                      # 同内容并发行去重
+        key = f"{h}:{seen[h]}"
+        try:
+            ts = int(datetime.fromisoformat(
+                row["Date"].replace("Z", "+00:00")).timestamp())
+        except Exception:
+            continue
+        cost_raw = (row.get("Cost") or "").strip()
+        try:
+            cost = float(cost_raw.lstrip("$")) if cost_raw not in ("", "Included") else None
+        except ValueError:
+            cost = None
+        day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        model = (row.get("Model") or "").strip()
+        kind = (row.get("Kind") or "").strip()
+        meta = json.dumps({"max_mode": (row.get("Max Mode") or "").strip() == "Yes",
+                           "cost_raw": cost_raw,
+                           "agent_id": row.get("Cloud Agent ID") or ""})
+        cur = c.execute("""INSERT OR IGNORE INTO usage_events
+            (app,event_key,ts,day,model,kind,session_id,
+             tok_in,tok_out,tok_cache_read,tok_cache_write,cost_usd,meta)
+            VALUES('cursor',?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (key, ts, day, model, kind, row.get("Cloud Agent ID") or None,
+             gi("Input (w/ Cache Write)") + gi("Input (w/o Cache Write)"),
+             gi("Output Tokens"), gi("Cache Read"), gi("Input (w/ Cache Write)"),
+             cost, meta))
+        n += cur.rowcount
+    return n
+
+
+def _collect_cursor_local(c) -> int:
+    """state.vscdb 只读：composerHeaders + bubbles → local_sessions(source='cursor')；
+    aiCodeTracking.dailyStats → daily_activity。增量：只扫 lastUpdatedAt 变了的 composer。"""
+    dbp = _cursor_state_db()
+    if not dbp.exists():
+        return 0
+    src = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
+    src.execute("PRAGMA query_only=1")
+    now = int(time.time())
+    n = 0
+    try:
+        headers = src.execute(
+            "SELECT composerId, createdAt, lastUpdatedAt, value FROM composerHeaders").fetchall()
+    except sqlite3.Error:
+        headers = []
+    for cid, created_ms, updated_ms, hval in headers:
+        have = c.execute("SELECT last_seen FROM local_sessions WHERE session_id=?",
+                         (f"cursor:{cid}",)).fetchone()
+        if have and have[0] and updated_ms and updated_ms // 1000 <= have[0]:
+            continue                            # 未变化，跳过
+        # 逐 bubble 读 value 在 11GB 库上太贵（~23s/会话）。消息数从
+        # composerData.fullConversationHeadersOnly 推——单行一次读。
+        row = src.execute("SELECT value FROM cursorDiskKV WHERE key=?",
+                          (f"composerData:{cid}",)).fetchone()
+        name = None
+        try:
+            name = json.loads(hval).get("name") if hval else None
+        except Exception:
+            pass
+        nu = na = 0
+        model = None
+        if row and row[0]:
+            try:
+                cd = json.loads(row[0])
+                name = name or cd.get("name")
+                model = ((cd.get("modelConfig") or {}).get("modelName")) or None
+                for b in cd.get("fullConversationHeadersOnly") or []:
+                    if b.get("type") == 1:
+                        nu += 1
+                    elif b.get("type") == 2:
+                        na += 1
+            except Exception:
+                pass
+        c.execute("""INSERT INTO local_sessions
+            (session_id,source,model,title,created_at,last_activity_at,
+             n_user,n_assistant,n_tool,n_system,n_tool_calls,n_prompts,
+             tok_in,tok_out,tok_cache_read,tok_cache_write,first_seen,last_seen)
+            VALUES (?,?,?,?,?,?,?,?,0,0,0,?,0,0,0,0,?,?)
+            ON CONFLICT(session_id) DO UPDATE SET
+             model=excluded.model, title=excluded.title,
+             last_activity_at=excluded.last_activity_at,
+             n_user=excluded.n_user, n_assistant=excluded.n_assistant,
+             n_prompts=excluded.n_prompts,
+             last_seen=excluded.last_seen""",
+            (f"cursor:{cid}", "cursor", model, name,
+             (created_ms or 0) // 1000, (updated_ms or 0) // 1000,
+             nu, na, nu, now, now))
+        n += 1
+    # Tab/Composer 日行统计
+    for (key, val) in src.execute(
+            "SELECT key,value FROM ItemTable WHERE key LIKE 'aiCodeTracking.dailyStats.%'"):
+        try:
+            d = json.loads(val)
+            day = d.get("date") or key.rsplit(".", 1)[-1]
+            for metric in ("tabSuggestedLines", "tabAcceptedLines",
+                           "composerSuggestedLines", "composerAcceptedLines"):
+                if metric in d:
+                    c.execute("INSERT OR REPLACE INTO daily_activity VALUES('cursor',?,?,?)",
+                              (day, metric, int(d[metric] or 0)))
+        except Exception:
+            continue
+    src.close()
+    return n
+
+
+def collect_cursor(c):
+    if not _cursor_state_db().exists():
+        log_run(c, "cursor", "skip", "state.vscdb 不存在")
+        return 0
+    n_sess = _collect_cursor_local(c)
+    token = cursor_access_token(c)
+    n_ev = 0
+    if token:
+        try:
+            n_ev = _collect_cursor_csv(c, token)
+        except Exception as e:
+            log_run(c, "cursor-csv", "error", str(e))
+    else:
+        log_run(c, "cursor-csv", "skip", "无 access token")
+    log_run(c, "cursor", "ok", f"{n_sess} composers, +{n_ev} events")
+    return n_sess
+
+
+# ---------------------------------------------------------------- antigravity
+
+def _pb_fields(data: bytes):
+    """极简 protobuf 解码：产出 (field_no, wire_type, value)。value: varint=int, len-delimited=bytes。"""
+    out = []
+    i, n = 0, len(data)
+    while i < n:
+        # tag varint
+        tag = 0
+        shift = 0
+        while i < n:
+            b = data[i]; i += 1
+            tag |= (b & 0x7f) << shift
+            shift += 7
+            if not b & 0x80:
+                break
+        fn, wt = tag >> 3, tag & 7
+        if fn == 0:
+            break
+        if wt == 0:
+            v = 0
+            shift = 0
+            while i < n:
+                b = data[i]; i += 1
+                v |= (b & 0x7f) << shift
+                shift += 7
+                if not b & 0x80:
+                    break
+            out.append((fn, wt, v))
+        elif wt == 2:
+            ln = 0
+            shift = 0
+            while i < n:
+                b = data[i]; i += 1
+                ln |= (b & 0x7f) << shift
+                shift += 7
+                if not b & 0x80:
+                    break
+            out.append((fn, wt, data[i:i + ln]))
+            i += ln
+        elif wt == 1:
+            out.append((fn, wt, data[i:i + 8])); i += 8
+        elif wt == 5:
+            out.append((fn, wt, data[i:i + 4])); i += 4
+        else:
+            break
+    return out
+
+
+def _pb_get(fields, no, wt=None):
+    for f in fields:
+        if f[0] == no and (wt is None or f[1] == wt):
+            return f[2]
+    return None
+
+
+def _pb_ts(msg: bytes) -> "int | None":
+    """google.protobuf.Timestamp → unix 秒。"""
+    v = _pb_get(_pb_fields(msg), 1, 0)
+    return int(v) if v and v > 0 else None
+
+
+def _agy_gen_event(blob: bytes):
+    """gen_metadata.data → dict|None。结构(逆向自 openusage#1139):
+    field1(wrap){ 19:modelID 21:label 4:usage{1:sys 2:in 3:out 5:cacheRead} 9:timing{4:Timestamp} }"""
+    wrap = _pb_get(_pb_fields(blob), 1, 2)
+    if not wrap:
+        return None
+    w = _pb_fields(wrap)
+    model = _pb_get(w, 19, 2)
+    label = _pb_get(w, 21, 2)
+    usage = _pb_get(w, 4, 2)
+    if usage is None:
+        return None
+    u = _pb_fields(usage)
+    sys_tok = int(_pb_get(u, 1, 0) or 0)
+    tin = int(_pb_get(u, 2, 0) or 0)
+    tout = int(_pb_get(u, 3, 0) or 0)
+    tcr = int(_pb_get(u, 5, 0) or 0)
+    if not (model or label or tin or tout or tcr or sys_tok):
+        return None
+    timing = _pb_get(w, 9, 2)
+    ts = _pb_ts(_pb_get(_pb_fields(timing), 4, 2) or b"") if timing else None
+    def _s(b):
+        try:
+            return b.decode("utf-8").strip() or None if b else None
+        except Exception:
+            return None
+    return {"model": _s(model), "label": _s(label),
+            "tin": sys_tok + tin, "tout": tout, "tcr": tcr, "ts": ts}
+
+
+def collect_antigravity(c):
+    """~/.gemini/antigravity*/conversations/*.db（只读）→ usage_events + local_sessions。"""
+    roots = sorted(Path.home().glob(".gemini/antigravity*/conversations"))
+    dbs = [p for r in roots for p in r.glob("*.db")]
+    if not dbs:
+        log_run(c, "antigravity", "skip", "无 conversations/*.db")
+        return 0
+    now = int(time.time())
+    n_ev = n_sess = 0
+    for p in dbs:
+        try:
+            src = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            src.execute("PRAGMA query_only=1")
+            meta = src.execute(
+                "SELECT trajectory_id, cascade_id FROM trajectory_meta LIMIT 1").fetchone()
+            tid = (meta[0] or meta[1]) if meta else p.stem
+            steps_ts = {}
+            for idx, md in src.execute("SELECT idx, metadata FROM steps"):
+                if md:
+                    t = _pb_ts(_pb_get(_pb_fields(md), 1, 2) or b"")
+                    if t:
+                        steps_ts[idx] = t
+            evs = []
+            for idx, blob in src.execute("SELECT idx, data FROM gen_metadata"):
+                ev = _agy_gen_event(blob or b"")
+                if not ev:
+                    continue
+                ts = ev["ts"] or steps_ts.get(idx)
+                if not ts:
+                    continue                    # 无时间戳的事件不入账
+                evs.append((idx, ts, ev))
+            src.close()
+            models = set()
+            t_in = t_out = t_cr = 0
+            ts_list = []
+            for idx, ts, ev in evs:
+                key = f"{tid}:{idx}"
+                day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                cur = c.execute("""INSERT OR IGNORE INTO usage_events
+                    (app,event_key,ts,day,model,kind,session_id,
+                     tok_in,tok_out,tok_cache_read,tok_cache_write,cost_usd,meta)
+                    VALUES('antigravity',?,?,?,?,'gen',?,?,?,?,0,NULL,?)""",
+                    (key, ts, day, ev["model"] or ev["label"] or "?",
+                     f"agy:{tid}", ev["tin"], ev["tout"], ev["tcr"],
+                     json.dumps({"label": ev["label"], "model_id": ev["model"]})))
+                n_ev += cur.rowcount
+                models.add(ev["label"] or ev["model"] or "?")
+                t_in += ev["tin"]; t_out += ev["tout"]; t_cr += ev["tcr"]
+                ts_list.append(ts)
+            if ts_list:
+                c.execute("""INSERT INTO local_sessions
+                    (session_id,source,model,title,created_at,last_activity_at,
+                     n_user,n_assistant,n_tool,n_system,n_tool_calls,n_prompts,
+                     tok_in,tok_out,tok_cache_read,tok_cache_write,first_seen,last_seen)
+                    VALUES (?,?,?,?,?,?,0,?,0,0,0,0,?,?,?,0,?,?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                     model=excluded.model, last_activity_at=excluded.last_activity_at,
+                     n_assistant=excluded.n_assistant, tok_in=excluded.tok_in,
+                     tok_out=excluded.tok_out, tok_cache_read=excluded.tok_cache_read,
+                     last_seen=excluded.last_seen""",
+                    (f"agy:{tid}", "antigravity", ",".join(sorted(models))[:200],
+                     p.stem, min(ts_list), max(ts_list), len(ts_list),
+                     t_in, t_out, t_cr, now, now))
+                n_sess += 1
+        except Exception:
+            continue
+    log_run(c, "antigravity", "ok", f"{n_sess} conversations, +{n_ev} events")
+    return n_sess
+
+
 # 等效价格表（每 1M token 美元，prefix 首个命中者胜；"" 为兜底）
 # 公开 API 刊例价；swe-2 无公开价，默认按 Sonnet 档折算。
 # 可在 data/prices.json 覆盖/新增：{"rules":[["prefix",in,out,cr,cw],...]}
@@ -432,7 +846,9 @@ def cmd_collect(args):
     results = {}
     for name, fn in (("quota", lambda: collect_quota(c, token)),
                      ("cloud", lambda: collect_cloud(c, token, org)),
-                     ("local", lambda: collect_local(c))):
+                     ("local", lambda: collect_local(c)),
+                     ("cursor", lambda: collect_cursor(c)),
+                     ("antigravity", lambda: collect_antigravity(c))):
         if args.only and name != args.only:
             continue
         if name in ("quota", "cloud") and not token:
@@ -580,6 +996,34 @@ def cmd_report(args):
                    if r["credit_cost"] or r["acu_cost"] else ""))
     print(f"等效成本合计 ≈ ${total_usd:.2f}  "
           f"(按公开 API 价折算；swe-2 无公开价按 Sonnet 档，改价见 data/prices.json)")
+
+    # 其他应用：usage_events（cursor=服务端真实口径，antigravity=本地 gen 记录）
+    ev = c.execute("""SELECT app, model, count(*), sum(tok_in), sum(tok_out),
+                      sum(tok_cache_read), sum(cost_usd)
+                      FROM usage_events WHERE ts>=? GROUP BY app, model
+                      ORDER BY 1, 4 DESC""", (since,)).fetchall()
+    if ev:
+        print("--- 其他应用（事件级真实 token）---")
+        for app, model, n, ti, to, tcr, cost in ev:
+            usd = cost_usd(ti or 0, to or 0, tcr or 0, 0,
+                           price_of(model, rules))
+            cost_s = (f" 实扣${cost:.2f}" if cost else f" ≈${usd:.2f}")
+            print(f"  {app:11} {(model or '?'):34} req={n:5} "
+                  f"in={_tok(ti)} out={_tok(to)} cr={_tok(tcr)}{cost_s}")
+        real = c.execute("SELECT sum(cost_usd) FROM usage_events WHERE ts>=?",
+                         (since,)).fetchone()[0]
+        if real:
+            print(f"  其中 Cursor 服务端实扣: ${real:.2f}")
+    acts = c.execute("""SELECT day, sum(CASE WHEN metric='tabAcceptedLines' THEN value END),
+                       sum(CASE WHEN metric='composerAcceptedLines' THEN value END)
+                       FROM daily_activity WHERE app='cursor' AND day>=?
+                       GROUP BY day ORDER BY day DESC LIMIT 10""",
+                     (datetime.fromtimestamp(since).strftime("%Y-%m-%d")
+                      if since else "0000-00-00",)).fetchall()
+    if acts:
+        print("--- Cursor 行级采纳（AI 写代码量）---")
+        for day, tab, comp in acts:
+            print(f"  {day}  tab={tab or 0}行  composer={comp or 0}行")
 
 
 def cmd_sessions(args):

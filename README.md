@@ -27,10 +27,13 @@ Windows + macOS + Linux（含无头 VPS）。
 
 - `devin_usage.py`：单文件 Python（**仅标准库**），采集 + 报表 + 实时监控
 - `devin-usage-tray`：Rust 托盘图标，60s 刷新配额/SWE-2 用量，图标随配额变色
-- 数据存自己的 `data/usage.db`，对 Devin 的库**只读不写**；token 运行时现读，
+- **多应用覆盖**：Devin App/CLI/Cloud + Cursor + Antigravity
+- 数据存自己的 `data/usage.db`，对各应用的库**只读不写**；token 运行时现读，
   重新登录自动生效；采集幂等可反复跑
 
 ## 数据源（逆向结果）
+
+### Devin
 
 | 源 | 端点/位置 | 采到什么 |
 |---|---|---|
@@ -42,10 +45,27 @@ Windows + macOS + Linux（含无头 VPS）。
 `input_tokens`/`output_tokens`/`cache_read_tokens`/`cache_creation_tokens`，
 采集时聚合到 `local_sessions.tok_*`。计费信号另看周配额%与云端 ACU。
 
+### Cursor
+
+| 源 | 位置 | 采到什么 |
+|---|---|---|
+| 服务端导出 | `GET cursor.com/api/dashboard/export-usage-events-csv`（Cookie `WorkosCursorSessionToken={userId}%3A%3A{accessToken}`，token 从 `state.vscdb` 的 `cursorAuth/*` 读，过期走 `api2.cursor.sh/oauth/token` 刷新，刷新结果只写自己的 kv） | **计费级真实数据**：每次请求的 input(w/wo cache write)/cache-read/output/total + Cost 列（Ultra 订阅内为 `Included`） |
+| 本地会话 | `state.vscdb` 只读：`composerHeaders` + `cursorDiskKV` 的 `composerData:*` | 会话列表、标题、模型、消息数（headers 推算，不逐条读 bubble——11GB 库逐条读太慢） |
+| 日行统计 | `ItemTable` 的 `aiCodeTracking.dailyStats.*` | tab/composer 每日建议与采纳行数 |
+
+### Antigravity
+
+| 源 | 位置 | 采到什么 |
+|---|---|---|
+| 本地会话库 | `~/.gemini/antigravity*/conversations/*.db` 只读，`gen_metadata` 表 protobuf | 每次生成的**真实 token**：`field1{19:modelID 21:label 4:usage{1:系统prompt 2:输入 3:输出 5:缓存读} 9:timing{4:时间戳}}`，时间戳缺失时回退 `steps.metadata` |
+
+解码方法参考开源实现 [openusage#1139](https://github.com/robinebers/openusage/pull/1139)。
+`.pb` 旧格式/加密文件跳过。
+
 ## 用法
 
 ```bash
-python devin_usage.py collect          # 采集一轮（~3s，幂等）
+python devin_usage.py collect          # 采集一轮（~30s，幂等；--only 可单采某源）
 python devin_usage.py report           # 全部汇总；--today/--week/--month/--json
 python devin_usage.py quota            # 配额快照 + 最近趋势
 python devin_usage.py sessions -n 20   # 会话明细（本地+云端）
