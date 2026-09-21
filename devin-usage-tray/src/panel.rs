@@ -320,11 +320,6 @@ fn quota_line(
             }
         );
     }
-    let tail_w: f32 = tail
-        .chars()
-        .map(|ch| if ch.is_ascii() { 6.6 } else { 13.0 })
-        .sum::<f32>()
-        + 4.0;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.add_sized(
@@ -332,14 +327,31 @@ fn quota_line(
             egui::Label::new(egui::RichText::new(name).small()).truncate(),
         );
         let frac = (pct / 100.0).clamp(0.0, 1.0) as f32;
-        // 百分比占固定 34px，条吃中间剩余
+        // 条固定全长=100%：剩余彩色，已消耗留白（白底+描边）
+        // 列宽：名92 + 条 + %34 + 尾150（右对齐），各行条宽一致
         let bar_w =
-            (ui.available_width() - tail_w - 34.0 - 12.0).clamp(40.0, 400.0);
-        ui.add(
-            egui::ProgressBar::new(frac)
-                .desired_width(bar_w)
-                .desired_height(10.0)
-                .fill(quota_color(pct)),
+            (ui.available_width() - 34.0 - 150.0 - 12.0).clamp(40.0, 400.0);
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(bar_w, 10.0),
+            egui::Sense::hover(),
+        );
+        let painter = ui.painter();
+        painter.rect_filled(rect, 5.0, egui::Color32::WHITE);
+        if frac > 0.0 {
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    rect.min,
+                    egui::vec2(rect.width() * frac, rect.height()),
+                ),
+                5.0,
+                quota_color(pct),
+            );
+        }
+        painter.rect_stroke(
+            rect,
+            5.0,
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(200)),
+            egui::StrokeKind::Inside,
         );
         ui.add_sized(
             [34.0, 16.0],
@@ -354,9 +366,14 @@ fn quota_line(
             )
             .truncate(),
         );
-        if !tail.is_empty() {
-            ui.label(egui::RichText::new(tail).weak().small());
-        }
+        // 尾巴固定宽右对齐，保证各行条宽一致
+        ui.allocate_ui_with_layout(
+            egui::vec2(150.0, 16.0),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.label(egui::RichText::new(&tail).weak().small());
+            },
+        );
     });
 }
 
@@ -729,17 +746,23 @@ impl Panel {
         if list.is_empty() {
             return;
         }
+        let has_hours = list.iter().any(|(_, f)| f.hours > 0.0);
         egui::ScrollArea::horizontal()
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 egui::Grid::new("fams")
-                    .num_columns(7)
+                    .num_columns(if has_hours { 7 } else { 6 })
                     .spacing([10.0, 4.0])
                     .striped(true)
                     .show(ui, |ui| {
-                        for h in ["模型族", "会话", "输入", "输出", "缓存读", "时长", "≈$"] {
+                        ui.label(egui::RichText::new("模型族").weak().small());
+                        for h in ["会话", "输入", "输出", "缓存读"] {
                             ui.label(egui::RichText::new(h).weak().small());
                         }
+                        if has_hours {
+                            ui.label(egui::RichText::new("时长").weak().small());
+                        }
+                        ui.label(egui::RichText::new("≈$").weak().small());
                         ui.end_row();
                         for (name, f) in &list {
                             ui.label(name);
@@ -747,11 +770,9 @@ impl Panel {
                             ui.monospace(tok_zh(f.tin));
                             ui.monospace(tok_zh(f.tout));
                             ui.monospace(tok_zh(f.tcr));
-                            ui.monospace(if f.hours > 0.0 {
-                                format!("{:.1}h", f.hours)
-                            } else {
-                                "—".into()
-                            });
+                            if has_hours {
+                                ui.monospace(format!("{:.1}h", f.hours));
+                            }
                             ui.monospace(usd(f.usd));
                             ui.end_row();
                         }
