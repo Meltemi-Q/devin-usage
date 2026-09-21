@@ -282,7 +282,7 @@ impl Panel {
         }
     }
 
-    /// 配额趋势面积图（自动 y 范围——只收集了几小时时不再被压成平线）
+    /// 配额趋势线（y 下界随数据自适应、上界恒为 100；点图叠加让拐点可见）
     fn quota_plot(&self, ui: &mut egui::Ui) {
         if self.charts.quota.len() < 2 {
             return;
@@ -295,29 +295,46 @@ impl Panel {
             .enumerate()
             .map(|(i, (_, p))| [i as f64, *p])
             .collect();
+        // y 下界：数据最小值向下取整到 20 的倍数再留 5pt 余量，<=100 顶格
+        let min_v = pts.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
+        let ymin = ((min_v / 20.0).floor() * 20.0 - 5.0).clamp(0.0, 80.0);
         Plot::new("quota")
-            .height(100.0)
+            .height(95.0)
+            .include_y(ymin)
+            .include_y(100.0)
             .x_axis_formatter(Self::x_fmt(&labels, 4))
             .y_axis_formatter(|m, _| format!("{:.0}%", m.value))
             .label_formatter(|name, p| format!("{name} {:.0}%", p.y))
-            .legend(Legend::default())
+            .legend(Legend::default().position(egui_plot::Corner::LeftTop))
             .show(ui, |pui| {
-                pui.line(
-                    Line::new("周配额剩余", pts)
-                        .color(GREEN)
-                        .width(2.0_f32)
-                        .fill(0.0_f32),
+                pui.line(Line::new("周配额剩余", pts.clone()).color(GREEN).width(2.0_f32));
+                pui.points(
+                    egui_plot::Points::new("周配额剩余", pts).color(GREEN).radius(2.0_f32),
                 );
             });
     }
 
-    /// 每日 token 堆叠柱状图（按 in/out/缓存读/缓存写 分色，单位 M；点柱子选日期）
+    /// 每日 token 堆叠柱状图：单位按最大值自适应（亿/M/k），柱顶标总量，点柱子选日期
     fn daily_plot(&mut self, ui: &mut egui::Ui) {
         if self.charts.daily.is_empty() {
             return;
         }
         let labels: Vec<String> =
             self.charts.daily.iter().map(|d| d.label.clone()).collect();
+        // 自适应单位：按最大日总量选亿/M/k，轴与悬停同单位
+        let max_tot: f64 = self
+            .charts
+            .daily
+            .iter()
+            .map(|d| d.vals.iter().sum::<f64>())
+            .fold(0.0, f64::max);
+        let (div, unit): (f64, &str) = if max_tot >= 1e8 {
+            (1e8, "亿")
+        } else if max_tot >= 1e6 {
+            (1e6, "M")
+        } else {
+            (1e3, "k")
+        };
         let series: [(&str, usize, egui::Color32); 4] = [
             ("输入", 0, C_IN),
             ("输出", 1, C_OUT),
@@ -335,8 +352,8 @@ impl Panel {
                         .iter()
                         .enumerate()
                         .map(|(i, d)| {
-                            let off: f64 = (0..*idx).map(|j| d.vals[j] / 1e6).sum();
-                            let mut b = Bar::new(i as f64, d.vals[*idx] / 1e6)
+                            let off: f64 = (0..*idx).map(|j| d.vals[j] / div).sum();
+                            let mut b = Bar::new(i as f64, d.vals[*idx] / div)
                                 .width(0.6)
                                 .fill(*color);
                             b.base_offset = Some(off);
@@ -346,17 +363,40 @@ impl Panel {
                 )
             })
             .collect();
+        // 柱顶总量标签（<=40 天才画，多了会糊成一团）
+        let tops: Vec<(f64, f64, String)> = if self.charts.daily.len() <= 40 {
+            self.charts
+                .daily
+                .iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    let tot: f64 = d.vals.iter().sum::<f64>() / div;
+                    let txt = if tot >= 100.0 {
+                        format!("{:.0}", tot)
+                    } else if tot >= 10.0 {
+                        format!("{:.1}", tot)
+                    } else {
+                        format!("{:.2}", tot)
+                    };
+                    (i as f64, tot, format!("{txt}{unit}"))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let meta: Vec<(String, [f64; 4])> = self
             .charts
             .daily
             .iter()
             .map(|d| (d.label.clone(), d.vals))
             .collect();
+        let ymax = max_tot / div;
         let presp = Plot::new("daily")
-            .height(110.0)
+            .height(120.0)
             .include_y(0.0)
+            .include_y(ymax * 1.12)            // 给柱顶标签留位
             .x_axis_formatter(Self::x_fmt(&labels, 7))
-            .y_axis_formatter(|m, _| format!("{:.0}M", m.value))
+            .y_axis_formatter(move |m, _| format!("{:.0}{unit}", m.value))
             .label_formatter(move |name, p| {
                 let i = p.x.round() as usize;
                 if let Some((day, v)) = meta.get(i) {
@@ -365,15 +405,23 @@ impl Panel {
                         .position(|n| *n == name)
                         .unwrap_or(0);
                     let tot: f64 = v.iter().sum();
-                    format!("{day} {name} {:.2}M / 合计 {:.2}M", v[idx] / 1e6, tot / 1e6)
+                    format!("{day} {name} {:.2}{unit} / 合计 {:.2}{unit}",
+                            v[idx] / div, tot / div)
                 } else {
-                    format!("{name} {:.2}M", p.y)
+                    format!("{name} {:.2}{unit}", p.y)
                 }
             })
-            .legend(Legend::default())
+            .legend(Legend::default().position(egui_plot::Corner::LeftTop))
             .show(ui, |pui| {
                 for c in charts {
                     pui.bar_chart(c);
+                }
+                for (x, y, t) in &tops {
+                    pui.text(egui_plot::Text::new(
+                        "",
+                        egui_plot::PlotPoint::new(*x, *y * 1.05),
+                        egui::RichText::new(t).size(9.0).weak(),
+                    ));
                 }
             });
         // 点击柱子 → 选中/取消该天，下方出明细
