@@ -714,25 +714,32 @@ impl Panel {
         if list.is_empty() {
             return;
         }
-        egui::Grid::new("fams")
-            .num_columns(7)
-            .spacing([10.0, 4.0])
-            .striped(true)
+        egui::ScrollArea::horizontal()
+            .auto_shrink([false, true])
             .show(ui, |ui| {
-                for h in ["模型族", "会话", "输入", "输出", "缓存读", "时长", "≈$"] {
-                    ui.label(egui::RichText::new(h).weak().small());
-                }
-                ui.end_row();
-                for (name, f) in &list {
-                    ui.label(name);
-                    ui.monospace(format!("{}", f.sessions));
-                    ui.monospace(tok_zh(f.tin));
-                    ui.monospace(tok_zh(f.tout));
-                    ui.monospace(tok_zh(f.tcr));
-                    ui.monospace(format!("{:.1}h", f.hours));
-                    ui.monospace(usd(f.usd));
-                    ui.end_row();
-                }
+                egui::Grid::new("fams")
+                    .num_columns(7)
+                    .spacing([10.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for h in ["模型族", "会话", "输入", "输出", "缓存读", "时长", "≈$"] {
+                            ui.label(egui::RichText::new(h).weak().small());
+                        }
+                        ui.end_row();
+                        for (name, f) in &list {
+                            ui.add(
+                                egui::Label::new(name)
+                                    .truncate(),
+                            );
+                            ui.monospace(format!("{}", f.sessions));
+                            ui.monospace(tok_zh(f.tin));
+                            ui.monospace(tok_zh(f.tout));
+                            ui.monospace(tok_zh(f.tcr));
+                            ui.monospace(format!("{:.1}h", f.hours));
+                            ui.monospace(usd(f.usd));
+                            ui.end_row();
+                        }
+                    });
             });
 
         // 具体型号全列表（可折叠；型号名长，包横向滚动条）
@@ -755,9 +762,12 @@ impl Panel {
                                 }
                                 ui.end_row();
                                 for m in models {
-                                    ui.label(
-                                        egui::RichText::new(format!("{}·{}", m.source, m.model))
-                                            .small(),
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("{}·{}", m.source, m.model))
+                                                .small(),
+                                        )
+                                        .truncate(),
                                     );
                                     ui.monospace(format!("{}", m.all.sessions));
                                     ui.monospace(tok_zh(m.all.tin));
