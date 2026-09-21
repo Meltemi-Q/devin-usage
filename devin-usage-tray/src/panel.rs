@@ -323,6 +323,25 @@ impl Panel {
         if !ap.plan.is_empty() {
             s += &format!("套餐: {}\n", ap.plan);
         }
+        for (label, pct, resets, used, lim) in &ap.quota_rows {
+            let mut l = format!("配额 {}: 剩 {:.0}%", label.trim_start_matches('_'), pct);
+            if let (Some(u), Some(lm)) = (used, lim) {
+                l += &format!(" ({}/{})", *u as i64, *lm as i64);
+            }
+            if let Some(r) = resets {
+                let left = r - now();
+                l += &format!(
+                    " 重置 {}",
+                    if left <= 0 {
+                        "待刷新".to_string()
+                    } else {
+                        format!("{}d{}h后", left / 86400, left % 86400 / 3600)
+                    }
+                );
+            }
+            s += &l;
+            s.push('\n');
+        }
         for m in &ap.models {
             s += &format!(
                 "  {}·{}  req {}  in {}  out {}  cacheR {}  ~${:.4}\n",
@@ -969,12 +988,12 @@ impl eframe::App for Panel {
                     ui.add_space(6.0);
                 }
 
-                // ---- 非 Devin 应用概要卡（会话数 + 套餐 + 附加指标）
+                // ---- 非 Devin 应用：配额卡（套餐配额）+ 概要卡
                 if self.tab != "devin" {
                     card(ui, |ui| {
                         if let Some(ap) = self.st.apps.get(self.tab) {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("用量概要").strong());
+                                ui.label(egui::RichText::new("配额").strong());
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -991,12 +1010,85 @@ impl eframe::App for Panel {
                                     },
                                 );
                             });
-                            ui.label(format!(
-                                "会话 {}（7d {}）· 请求 {}",
-                                ap.sessions_all, ap.sessions_7d, ap.total_all.sessions
-                            ));
+                            if ap.quota_rows.is_empty() {
+                                let hint = if self.tab == "antigravity" {
+                                    "暂无配额数据 — Antigravity 需在 IDE 运行时采集"
+                                } else {
+                                    "暂无配额数据 — 先跑一次 collect"
+                                };
+                                ui.label(egui::RichText::new(hint).weak().small());
+                            } else {
+                                for (label, pct, resets, used, lim) in
+                                    &ap.quota_rows
+                                {
+                                    ui.horizontal(|ui| {
+                                        let name = label.trim_start_matches('_');
+                                        ui.add_sized(
+                                            [150.0, 16.0],
+                                            egui::Label::new(
+                                                egui::RichText::new(name).small(),
+                                            )
+                                            .truncate(),
+                                        );
+                                        let frac =
+                                            (*pct / 100.0).clamp(0.0, 1.0) as f32;
+                                        ui.add(
+                                            egui::ProgressBar::new(frac)
+                                                .desired_width(110.0)
+                                                .desired_height(10.0)
+                                                .fill(quota_color(*pct)),
+                                        );
+                                        ui.monospace(
+                                            egui::RichText::new(format!(
+                                                "剩 {pct:.0}%"
+                                            ))
+                                            .small(),
+                                        );
+                                        let mut tail = String::new();
+                                        if let (Some(u), Some(l)) = (used, lim) {
+                                            tail += &format!(
+                                                " {}/{}",
+                                                *u as i64, *l as i64
+                                            );
+                                        }
+                                        if let Some(r) = resets {
+                                            let left = r - now();
+                                            tail += &format!(
+                                                " · 重置 {}",
+                                                if left <= 0 {
+                                                    "待刷新".to_string()
+                                                } else if left >= 86400 {
+                                                    format!(
+                                                        "{}d{}h后",
+                                                        left / 86400,
+                                                        left % 86400 / 3600
+                                                    )
+                                                } else {
+                                                    format!("{}h后", left / 3600)
+                                                }
+                                            );
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(tail).weak().small(),
+                                        );
+                                    });
+                                }
+                            }
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "会话 {}（7d {}）· 请求 {}",
+                                    ap.sessions_all,
+                                    ap.sessions_7d,
+                                    ap.total_all.sessions
+                                ))
+                                .weak()
+                                .small(),
+                            );
                             if !ap.extra.is_empty() {
-                                ui.label(egui::RichText::new(&ap.extra).weak().small());
+                                ui.label(
+                                    egui::RichText::new(&ap.extra).weak().small(),
+                                );
                             }
                         } else {
                             ui.label("暂无该应用的数据 — 先跑一次 collect");

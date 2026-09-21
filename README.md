@@ -52,12 +52,16 @@ Windows + macOS + Linux（含无头 VPS）。
 | 服务端导出 | `GET cursor.com/api/dashboard/export-usage-events-csv`（Cookie `WorkosCursorSessionToken={userId}%3A%3A{accessToken}`，token 从 `state.vscdb` 的 `cursorAuth/*` 读，过期走 `api2.cursor.sh/oauth/token` 刷新，刷新结果只写自己的 kv） | **计费级真实数据**：每次请求的 input(w/wo cache write)/cache-read/output/total + Cost 列（Ultra 订阅内为 `Included`） |
 | 本地会话 | `state.vscdb` 只读：`composerHeaders` + `cursorDiskKV` 的 `composerData:*` | 会话列表、标题、模型、消息数（headers 推算，不逐条读 bubble——11GB 库逐条读太慢） |
 | 日行统计 | `ItemTable` 的 `aiCodeTracking.dailyStats.*` | tab/composer 每日建议与采纳行数 |
+| 配额 | `GET cursor.com/api/usage-summary` | used/limit/remaining + auto/api 分别用量百分比 + **billingCycleEnd 重置日** |
 
 ### Antigravity
 
 | 源 | 位置 | 采到什么 |
 |---|---|---|
 | 本地会话库 | `~/.gemini/antigravity*/conversations/*.db` 只读，`gen_metadata` 表 protobuf | 每次生成的**真实 token**：`field1{19:modelID 21:label 4:usage{1:系统prompt 2:输入 3:输出 5:缓存读} 9:timing{4:时间戳}}`，时间戳缺失时回退 `steps.metadata` |
+| 配额 | 本机 language server `127.0.0.1:port`（进程命令行 `--app_data_dir antigravity` + `--csrf_token` 定位，netstat/lsof 找端口，POST `GetUserStatus`/`GetCommandModelConfigs`） | **每模型配额**：`quotaInfo{remainingFraction,resetTime}`；仅 IDE 运行时可用，IDE 关闭记 skip |
+
+配额快照存 `app_quota` 表（app+label+ts 幂等），面板各应用 Tab 顶部显示进度条和重置倒计时。
 
 解码方法参考开源实现 [openusage#1139](https://github.com/robinebers/openusage/pull/1139)。
 `.pb` 旧格式/加密文件跳过。

@@ -61,6 +61,9 @@ pub struct AppStats {
     pub sessions_all: i64,
     pub plan: String,      // 如 cursor 的 ultra
     pub extra: String,     // 附加说明行（如 tab 采纳行数）
+    /// 配额快照：(label, 剩余%, 重置unix, used, limit)
+    /// cursor: plan/auto/api；antigravity: _plan + 每模型一行
+    pub quota_rows: Vec<(String, f64, Option<i64>, Option<f64>, Option<f64>)>,
 }
 
 pub struct Quota {
@@ -524,10 +527,31 @@ fn load_app_stats(
     } else {
         a.models.iter().map(|m| m.usd_7d).sum()
     };
+    // 配额快照：每 label 取最新一条
+    if let Ok(mut s) = conn.prepare(
+        "SELECT label, pct_remaining, resets_at, used, lim FROM app_quota q
+         WHERE app=?1 AND ts=(SELECT max(ts) FROM app_quota
+                              WHERE app=q.app AND label=q.label)
+         ORDER BY CASE label WHEN 'plan' THEN 0 WHEN '_plan' THEN 1
+                             WHEN 'auto' THEN 2 WHEN 'api' THEN 3
+                             ELSE 9 END, label",
+    ) {
+        if let Ok(rows) = s.query_map([app], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<f64>>(3)?,
+                r.get::<_, Option<f64>>(4)?,
+            ))
+        }) {
+            a.quota_rows = rows.flatten().collect();
+        }
+    }
     // 附加信息：cursor 套餐 + tab/composer 采纳行数
     if let Ok(plan) = conn.query_row(
-        "SELECT value FROM kv WHERE key='cursor.plan'",
-        [],
+        "SELECT value FROM kv WHERE key=?1",
+        [format!("{app}.plan")],
         |r| r.get::<_, String>(0),
     ) {
         a.plan = plan;

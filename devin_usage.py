@@ -31,8 +31,11 @@ import json
 import os
 import re
 import sqlite3
+import ssl
+import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -174,6 +177,15 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE TABLE IF NOT EXISTS daily_activity (
   app TEXT NOT NULL, day TEXT NOT NULL, metric TEXT NOT NULL, value INTEGER,
   PRIMARY KEY(app, day, metric)
+);
+-- 各应用配额快照：cursor=usage-summary，antigravity=本地 language server
+CREATE TABLE IF NOT EXISTS app_quota (
+  app TEXT NOT NULL, label TEXT NOT NULL, ts INTEGER NOT NULL,
+  pct_remaining REAL,             -- 剩余百分比 0-100
+  used REAL, lim REAL,            -- 原始用量/上限（单位随应用）
+  resets_at INTEGER,              -- unix 秒，可空
+  meta TEXT,                      -- json 附加（套餐/成员类型等）
+  PRIMARY KEY(app, label, ts)
 );
 -- 自有 kv：存放刷新后的 cursor access token 等（不改对方库）
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
@@ -586,6 +598,48 @@ def _collect_cursor_local(c) -> int:
     return n
 
 
+CURSOR_USAGE_URL = "https://cursor.com/api/usage-summary"
+
+
+def _cursor_usage_summary(c, token) -> int:
+    """Cursor 配额：api/usage-summary → app_quota。
+    返回 used/limit/percentUsed + billingCycleEnd（=额度重置日）。"""
+    pay = _jwt_payload(token)
+    uid = (pay.get("sub") or "").split("|")[-1]
+    if not uid:
+        return 0
+    req = urllib.request.Request(CURSOR_USAGE_URL, headers={
+        "Cookie": f"WorkosCursorSessionToken={uid}%3A%3A{token}",
+        "Accept": "application/json", "User-Agent": UA})
+    j = json.loads(urllib.request.urlopen(req, timeout=20).read())
+    plan = (j.get("individualUsage") or {}).get("plan") or {}
+    now = int(time.time())
+    try:
+        resets = int(datetime.fromisoformat(
+            (j.get("billingCycleEnd") or "").replace("Z", "+00:00")).timestamp())
+    except Exception:
+        resets = None
+    n = 0
+    tot = plan.get("totalPercentUsed")
+    if tot is not None:
+        c.execute("INSERT OR REPLACE INTO app_quota VALUES('cursor','plan',?,?,?,?,?,?)",
+                  (now, 100.0 - float(tot), plan.get("used"), plan.get("limit"), resets,
+                   json.dumps({"membership": j.get("membershipType"),
+                               "auto_pct": plan.get("autoPercentUsed"),
+                               "api_pct": plan.get("apiPercentUsed")})))
+        n += 1
+    for label, key in (("auto", "autoPercentUsed"), ("api", "apiPercentUsed")):
+        p = plan.get(key)
+        if p is not None:
+            c.execute("INSERT OR REPLACE INTO app_quota VALUES('cursor',?,?,?,?,?,?,?)",
+                      (label, now, 100.0 - float(p), None, None, resets, None))
+            n += 1
+    if j.get("membershipType"):
+        c.execute("INSERT OR REPLACE INTO kv VALUES('cursor.plan',?)",
+                  (j["membershipType"],))
+    return n
+
+
 def collect_cursor(c):
     if not _cursor_state_db().exists():
         log_run(c, "cursor", "skip", "state.vscdb 不存在")
@@ -598,6 +652,11 @@ def collect_cursor(c):
             n_ev = _collect_cursor_csv(c, token)
         except Exception as e:
             log_run(c, "cursor-csv", "error", str(e))
+        try:
+            n_q = _cursor_usage_summary(c, token)
+            log_run(c, "cursor-quota", "ok", f"{n_q} 行")
+        except Exception as e:
+            log_run(c, "cursor-quota", "error", str(e))
     else:
         log_run(c, "cursor-csv", "skip", "无 access token")
     log_run(c, "cursor", "ok", f"{n_sess} composers, +{n_ev} events")
@@ -698,6 +757,10 @@ def _agy_gen_event(blob: bytes):
 
 def collect_antigravity(c):
     """~/.gemini/antigravity*/conversations/*.db（只读）→ usage_events + local_sessions。"""
+    try:
+        collect_antigravity_quota(c)
+    except Exception as e:
+        log_run(c, "antigravity-quota", "error", str(e))
     roots = sorted(Path.home().glob(".gemini/antigravity*/conversations"))
     dbs = [p for r in roots for p in r.glob("*.db")]
     if not dbs:
@@ -764,6 +827,155 @@ def collect_antigravity(c):
             continue
     log_run(c, "antigravity", "ok", f"{n_sess} conversations, +{n_ev} events")
     return n_sess
+
+
+# ---- antigravity 配额：本机 language server（IDE 运行时才可用）
+# 机制同官方 quota-watcher 扩展：进程命令行拿 --csrf_token，
+# netstat/lsof 找监听端口，POST Connect-RPC 拿 quotaInfo{remainingFraction,resetTime}
+
+def _antigravity_ls_procs():
+    """运行中的 antigravity language server → [(pid, csrf_token)]。"""
+    procs = []
+    try:
+        if IS_WIN:
+            ps = ("Get-CimInstance Win32_Process | "
+                  "Where-Object {$_.CommandLine -match 'app_data_dir'} | "
+                  "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=25, errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+            items = json.loads(out) if out.strip() else []
+            if isinstance(items, dict):
+                items = [items]
+            for it in items:
+                cl = it.get("CommandLine") or ""
+                if re.search(r"--app_data_dir[=\s]+antigravity\b", cl, re.I):
+                    m = re.search(r"--csrf_token[=\s]+([\w-]+)", cl)
+                    procs.append((int(it["ProcessId"]),
+                                  m.group(1) if m else None))
+        else:
+            out = subprocess.run(["ps", "-eo", "pid,args"],
+                                 capture_output=True, text=True,
+                                 timeout=15).stdout
+            for line in out.splitlines():
+                if re.search(r"--app_data_dir[=\s]+antigravity\b", line):
+                    try:
+                        pid = int(line.strip().split(None, 1)[0])
+                    except ValueError:
+                        continue
+                    m = re.search(r"--csrf_token[=\s]+([\w-]+)", line)
+                    procs.append((pid, m.group(1) if m else None))
+    except Exception:
+        pass
+    return procs
+
+
+def _antigravity_ports(pid):
+    """进程监听的 TCP 端口列表。"""
+    try:
+        if IS_WIN:
+            out = subprocess.run(["netstat", "-ano", "-p", "tcp"],
+                                 capture_output=True, text=True,
+                                 errors="replace", timeout=15).stdout
+            ports = []
+            for line in out.splitlines():
+                parts = line.split()
+                if (len(parts) >= 5 and parts[-1] == str(pid)
+                        and "LISTENING" in parts[-2].upper()):
+                    m = re.search(r":(\d+)$", parts[1])
+                    if m:
+                        ports.append(int(m.group(1)))
+            return ports
+        out = subprocess.run(
+            ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", str(pid)],
+            capture_output=True, text=True, timeout=15).stdout
+        return [int(m.group(1))
+                for m in re.finditer(r":(\d+)\s+\(LISTEN\)", out)]
+    except Exception:
+        return []
+
+
+def _ag_ls_post(port, path, csrf, use_https=True):
+    body = json.dumps({"metadata": {"ideName": "antigravity",
+                                    "extensionName": "antigravity",
+                                    "ideVersion": "1.0", "locale": "en"}}).encode()
+    scheme = "https" if use_https else "http"
+    req = urllib.request.Request(
+        f"{scheme}://127.0.0.1:{port}{path}", data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "Connect-Protocol-Version": "1",
+                 "X-Codeium-Csrf-Token": csrf, "User-Agent": UA})
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return json.loads(urllib.request.urlopen(
+        req, timeout=6, context=ctx if use_https else None).read())
+
+
+def collect_antigravity_quota(c) -> int:
+    """每模型剩余配额 + promptCredits，写 app_quota。IDE 不在跑就记 skip。"""
+    n = 0
+    for pid, csrf in _antigravity_ls_procs():
+        if not csrf:
+            continue
+        resp = None
+        for port in _antigravity_ports(pid):
+            for path in ("/exa.language_server_pb.LanguageServerService/GetUserStatus",
+                         "/exa.language_server_pb.LanguageServerService/GetCommandModelConfigs"):
+                try:
+                    resp = _ag_ls_post(port, path, csrf)
+                    break
+                except Exception:
+                    try:
+                        resp = _ag_ls_post(port, path, csrf, use_https=False)
+                        break
+                    except Exception:
+                        continue
+            if resp:
+                break
+        if not resp:
+            continue
+        us = resp.get("userStatus") or {}
+        plan = (us.get("planStatus") or {}).get("planInfo") or {}
+        now = int(time.time())
+        monthly = _f(plan.get("monthlyPromptCredits"))
+        avail = _f(plan.get("availablePromptCredits"))
+        if monthly and avail is not None:
+            c.execute("INSERT OR REPLACE INTO app_quota "
+                      "VALUES('antigravity','_plan',?,?,?,?,?,?)",
+                      (now, avail / monthly * 100, monthly - avail, monthly,
+                       None, json.dumps({"plan": plan.get("planName")})))
+            n += 1
+        configs = ((us.get("cascadeModelConfigData") or {})
+                   .get("clientModelConfigs")
+                   or resp.get("clientModelConfigs") or [])
+        for cfg in configs:
+            qi = cfg.get("quotaInfo")
+            if not qi:
+                continue
+            frac = _f(qi.get("remainingFraction"))
+            if frac is None:
+                continue
+            rt = qi.get("resetTime")
+            try:
+                resets = int(datetime.fromisoformat(
+                    rt.replace("Z", "+00:00")).timestamp()) if rt else None
+            except Exception:
+                resets = None
+            label = (cfg.get("label")
+                     or (cfg.get("modelOrAlias") or {}).get("model") or "?")
+            c.execute("INSERT OR REPLACE INTO app_quota "
+                      "VALUES('antigravity',?,?,?,?,?,?,?)",
+                      (label, now, frac * 100, None, None, resets,
+                       json.dumps({"model": (cfg.get("modelOrAlias") or {})
+                                   .get("model")})))
+            n += 1
+        break                                    # 第一个可用进程就够
+    log_run(c, "antigravity-quota",
+            "ok" if n else "skip",
+            f"{n} 行" if n else "IDE 未运行/端口不可用")
+    return n
 
 
 # 等效价格表（每 1M token 美元，prefix 首个命中者胜；"" 为兜底）
