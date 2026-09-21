@@ -135,18 +135,33 @@ fn load_charts(days: i64, app: &str) -> Charts {
         }
     }
     // 各列分开 sum：整行相加遇 NULL 会整行变 NULL（老会话无 metrics）
-    let sql = if app == "devin" {
-        "SELECT strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') day,
-                strftime('%m-%d', created_at, 'unixepoch', 'localtime') md,
-                sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
-         FROM local_sessions
-         WHERE created_at >= ?1 AND source NOT IN ('cursor','antigravity')
-         GROUP BY 1 ORDER BY 1"
-    } else {
-        "SELECT day, substr(day,6) md,
-                sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
-         FROM usage_events WHERE ts >= ?1 AND app = ?2
-         GROUP BY day ORDER BY day"
+    let sql = match app {
+        "devin" =>
+            "SELECT strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') day,
+                    strftime('%m-%d', created_at, 'unixepoch', 'localtime') md,
+                    sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
+             FROM local_sessions
+             WHERE created_at >= ?1
+               AND source NOT IN ('cursor','antigravity','zcode','grok')
+             GROUP BY 1 ORDER BY 1",
+        "all" =>
+            "SELECT day, substr(day,6) md,
+                    sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
+             FROM (
+               SELECT strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') day,
+                      tok_in, tok_out, tok_cache_read, tok_cache_write
+                 FROM local_sessions
+                 WHERE created_at >= ?1
+                   AND source NOT IN ('cursor','antigravity','zcode','grok')
+               UNION ALL
+               SELECT day, tok_in, tok_out, tok_cache_read, tok_cache_write
+                 FROM usage_events WHERE ts >= ?1
+             ) GROUP BY 1 ORDER BY 1",
+        _ =>
+            "SELECT day, substr(day,6) md,
+                    sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
+             FROM usage_events WHERE ts >= ?1 AND app = ?2
+             GROUP BY day ORDER BY day",
     };
     if let Ok(mut s) = conn.prepare(sql) {
         let parse = |r: &rusqlite::Row| -> rusqlite::Result<DayRow> {
@@ -161,10 +176,9 @@ fn load_charts(days: i64, app: &str) -> Charts {
                 ],
             })
         };
-        let rows = if app == "devin" {
-            s.query_map(rusqlite::params![t0], parse).ok()
-        } else {
-            s.query_map(rusqlite::params![t0, app], parse).ok()
+        let rows = match app {
+            "devin" | "all" => s.query_map(rusqlite::params![t0], parse).ok(),
+            _ => s.query_map(rusqlite::params![t0, app], parse).ok(),
         };
         if let Some(rows) = rows {
             c.daily = rows.flatten().collect();
@@ -184,22 +198,37 @@ fn load_day_detail(
     let Some(conn) = open_db() else {
         return (0, rows);
     };
-    let (sql, p2): (&str, Option<&str>) = if app == "devin" {
-        ("SELECT model, count(*) cnt, sum(n_user),
-                sum(tok_in), sum(tok_out), sum(tok_cache_read)
-         FROM local_sessions
-         WHERE strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') = ?1
-           AND source NOT IN ('cursor','antigravity')
-         GROUP BY model
-         ORDER BY ifnull(sum(tok_in),0)+ifnull(sum(tok_out),0)
-                  +ifnull(sum(tok_cache_read),0)+ifnull(sum(tok_cache_write),0) DESC",
-         None)
-    } else {
-        ("SELECT model, count(*), 0,
-                sum(tok_in), sum(tok_out), sum(tok_cache_read)
-         FROM usage_events WHERE day=?1 AND app=?2 GROUP BY model
-         ORDER BY sum(tok_in)+sum(tok_out)+sum(tok_cache_read) DESC",
-         Some(app))
+    let (sql, p2): (&str, Option<&str>) = match app {
+        "devin" =>
+            ("SELECT model, count(*) cnt, sum(n_user),
+                    sum(tok_in), sum(tok_out), sum(tok_cache_read)
+             FROM local_sessions
+             WHERE strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') = ?1
+               AND source NOT IN ('cursor','antigravity','zcode','grok')
+             GROUP BY model
+             ORDER BY ifnull(sum(tok_in),0)+ifnull(sum(tok_out),0)
+                      +ifnull(sum(tok_cache_read),0)+ifnull(sum(tok_cache_write),0) DESC",
+             None),
+        "all" =>
+            ("SELECT model, count(*), sum(nm),
+                    sum(tok_in), sum(tok_out), sum(tok_cache_read) FROM (
+                SELECT 'devin·'||model model, n_user nm,
+                       tok_in, tok_out, tok_cache_read FROM local_sessions
+                 WHERE strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') = ?1
+                   AND source NOT IN ('cursor','antigravity','zcode','grok')
+                UNION ALL
+                SELECT app||'·'||model, 0, tok_in, tok_out, tok_cache_read
+                  FROM usage_events WHERE day=?1
+             ) GROUP BY model
+             ORDER BY sum(ifnull(tok_in,0)+ifnull(tok_out,0)
+                        +ifnull(tok_cache_read,0)) DESC",
+             None),
+        _ =>
+            ("SELECT model, count(*), 0,
+                    sum(tok_in), sum(tok_out), sum(tok_cache_read)
+             FROM usage_events WHERE day=?1 AND app=?2 GROUP BY model
+             ORDER BY sum(tok_in)+sum(tok_out)+sum(tok_cache_read) DESC",
+             Some(app)),
     };
     if let Ok(mut s) = conn.prepare(sql) {
         let parse = |r: &rusqlite::Row| -> rusqlite::Result<(String, i64, i64, i64, i64, i64)> {
@@ -275,6 +304,54 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
+/// 一行配额：名称 + 进度条 + 剩余%/用尽 + used/limit + 重置倒计时
+fn quota_line(
+    ui: &mut egui::Ui,
+    name: &str,
+    pct: f64,
+    resets: Option<i64>,
+    used: Option<f64>,
+    lim: Option<f64>,
+) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [150.0, 16.0],
+            egui::Label::new(egui::RichText::new(name).small()).truncate(),
+        );
+        let frac = (pct / 100.0).clamp(0.0, 1.0) as f32;
+        ui.add(
+            egui::ProgressBar::new(frac)
+                .desired_width(110.0)
+                .desired_height(10.0)
+                .fill(quota_color(pct)),
+        );
+        let pct_txt = if pct <= 0.0 {
+            egui::RichText::new("已用尽").color(RED).small()
+        } else {
+            egui::RichText::new(format!("剩 {pct:.0}%")).small()
+        };
+        ui.add(egui::Label::new(pct_txt));
+        let mut tail = String::new();
+        if let (Some(u), Some(l)) = (used, lim) {
+            tail += &format!(" {}/{}", u as i64, l as i64);
+        }
+        if let Some(r) = resets {
+            let left = r - now();
+            tail += &format!(
+                " · 重置 {}",
+                if left <= 0 {
+                    "待刷新".to_string()
+                } else if left >= 86400 {
+                    format!("{}d{}h后", left / 86400, left % 86400 / 3600)
+                } else {
+                    format!("{}h后", left / 3600)
+                }
+            );
+        }
+        ui.label(egui::RichText::new(tail).weak().small());
+    });
+}
+
 impl Panel {
     fn new(st: Stats) -> Self {
         let report = build_report(&st);
@@ -297,10 +374,24 @@ impl Panel {
         if self.tab == "devin" {
             return self.report.clone();
         }
-        let name = if self.tab == "cursor" {
-            "Cursor"
-        } else {
-            "Antigravity"
+        if self.tab == "all" {
+            let mut s = format!("{}\n", self.report);
+            for (app_key, ap) in &self.st.apps {
+                s += &format!(
+                    "\n[{}] 会话 {} | 请求 {} | in {} out {} cacheR {} | ≈${:.2}\n",
+                    app_key, ap.sessions_all, ap.total_all.sessions,
+                    ap.total_all.tin, ap.total_all.tout, ap.total_all.tcr,
+                    ap.usd_all,
+                );
+            }
+            return s;
+        }
+        let name = match self.tab {
+            "cursor" => "Cursor",
+            "antigravity" => "Antigravity",
+            "zcode" => "ZCode",
+            "grok" => "Grok",
+            x => x,
         };
         let Some(ap) = self.st.apps.get(self.tab) else {
             return format!("{name} 暂无数据");
@@ -747,6 +838,22 @@ impl eframe::App for Panel {
                     "Devin 等效成本（公开 API 价折算）: 近7天 ${:.2} · SWE-2 ${:.2} · 累计 ${:.2}",
                     self.st.usd_7d, self.st.swe2_usd_7d, self.st.usd_all
                 )),
+                "all" => {
+                    let usd7: f64 = self.st.usd_7d
+                        + self.st.apps.values().map(|a| a.usd_7d).sum::<f64>();
+                    let usda: f64 = self.st.usd_all
+                        + self.st.apps.values().map(|a| a.usd_all).sum::<f64>();
+                    let real: f64 =
+                        self.st.apps.values().map(|a| a.real_usd_all).sum();
+                    let mut s = format!(
+                        "全部应用估算合计: 近7天 ${:.2} · 累计 ${:.2}",
+                        usd7, usda
+                    );
+                    if real > 0.0 {
+                        s += &format!(" · 其中实扣 ${:.2}", real);
+                    }
+                    ui.label(s)
+                }
                 key => {
                     if let Some(ap) = self.st.apps.get(key) {
                         let mut s = format!(
@@ -824,9 +931,12 @@ impl eframe::App for Panel {
             // 应用切换：各应用套餐/计费独立，不混计
             ui.horizontal(|ui| {
                 for (key, label) in [
+                    ("all", "总览"),
                     ("devin", "Devin"),
                     ("cursor", "Cursor"),
                     ("antigravity", "Antigravity"),
+                    ("zcode", "ZCode"),
+                    ("grok", "Grok"),
                 ] {
                     if ui.selectable_label(self.tab == key, label).clicked()
                         && self.tab != key
@@ -992,8 +1102,93 @@ impl eframe::App for Panel {
                     ui.add_space(6.0);
                 }
 
+                // ---- 总览：所有应用配额一览 + 各应用摘要
+                if self.tab == "all" {
+                    card(ui, |ui| {
+                        ui.label(egui::RichText::new("各应用配额").strong());
+                        if let Some(q) = &self.st.quota {
+                            quota_line(ui, "Devin 周配额", q.weekly_pct,
+                                       Some(q.weekly_reset), None, None);
+                        }
+                        for (app_key, ap) in &self.st.apps {
+                            let an = match app_key.as_str() {
+                                "cursor" => "Cursor",
+                                "antigravity" => "Antigravity",
+                                "zcode" => "ZCode",
+                                "grok" => "Grok",
+                                x => x,
+                            };
+                            if ap.quota_rows.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{an} · 无配额口径（本地统计）"
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            } else {
+                                for (label, pct, resets, used, lim) in
+                                    &ap.quota_rows
+                                {
+                                    quota_line(
+                                        ui,
+                                        &format!(
+                                            "{an}·{}",
+                                            label.trim_start_matches('_')
+                                        ),
+                                        *pct,
+                                        *resets,
+                                        *used,
+                                        *lim,
+                                    );
+                                }
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    card(ui, |ui| {
+                        ui.label(egui::RichText::new("各应用摘要").strong());
+                        egui::Grid::new("overview")
+                            .num_columns(4)
+                            .spacing([14.0, 4.0])
+                            .show(ui, |ui| {
+                                for h in ["应用", "会话/请求", "Token 总量", "≈成本"] {
+                                    ui.label(egui::RichText::new(h).weak().small());
+                                }
+                                ui.end_row();
+                                let t = &self.st.total_all;
+                                let sum = t.tin + t.tout + t.tcr + t.tcw;
+                                ui.label("Devin");
+                                ui.monospace(format!("{} 会话", t.sessions));
+                                ui.monospace(tok_zh(sum));
+                                ui.monospace(usd(self.st.usd_all));
+                                ui.end_row();
+                                for (app_key, ap) in &self.st.apps {
+                                    let an = match app_key.as_str() {
+                                        "cursor" => "Cursor",
+                                        "antigravity" => "Antigravity",
+                                        "zcode" => "ZCode",
+                                        "grok" => "Grok",
+                                        x => x,
+                                    };
+                                    let a = &ap.total_all;
+                                    let asum = a.tin + a.tout + a.tcr + a.tcw;
+                                    ui.label(an);
+                                    ui.monospace(format!(
+                                        "{} 会话 · {} 请求",
+                                        ap.sessions_all, a.sessions
+                                    ));
+                                    ui.monospace(tok_zh(asum));
+                                    ui.monospace(usd(ap.usd_all));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                    ui.add_space(6.0);
+                }
+
                 // ---- 非 Devin 应用：配额卡（套餐配额）+ 概要卡
-                if self.tab != "devin" {
+                if self.tab != "devin" && self.tab != "all" {
                     card(ui, |ui| {
                         if let Some(ap) = self.st.apps.get(self.tab) {
                             ui.horizontal(|ui| {
@@ -1025,62 +1220,14 @@ impl eframe::App for Panel {
                                 for (label, pct, resets, used, lim) in
                                     &ap.quota_rows
                                 {
-                                    ui.horizontal(|ui| {
-                                        let name = label.trim_start_matches('_');
-                                        ui.add_sized(
-                                            [150.0, 16.0],
-                                            egui::Label::new(
-                                                egui::RichText::new(name).small(),
-                                            )
-                                            .truncate(),
-                                        );
-                                        let frac =
-                                            (*pct / 100.0).clamp(0.0, 1.0) as f32;
-                                        ui.add(
-                                            egui::ProgressBar::new(frac)
-                                                .desired_width(110.0)
-                                                .desired_height(10.0)
-                                                .fill(quota_color(*pct)),
-                                        );
-                                        let pct_txt = if *pct <= 0.0 {
-                                            egui::RichText::new("已用尽")
-                                                .color(RED)
-                                                .small()
-                                        } else {
-                                            egui::RichText::new(format!(
-                                                "剩 {pct:.0}%"
-                                            ))
-                                            .small()
-                                        };
-                                        ui.add(egui::Label::new(pct_txt));
-                                        let mut tail = String::new();
-                                        if let (Some(u), Some(l)) = (used, lim) {
-                                            tail += &format!(
-                                                " {}/{}",
-                                                *u as i64, *l as i64
-                                            );
-                                        }
-                                        if let Some(r) = resets {
-                                            let left = r - now();
-                                            tail += &format!(
-                                                " · 重置 {}",
-                                                if left <= 0 {
-                                                    "待刷新".to_string()
-                                                } else if left >= 86400 {
-                                                    format!(
-                                                        "{}d{}h后",
-                                                        left / 86400,
-                                                        left % 86400 / 3600
-                                                    )
-                                                } else {
-                                                    format!("{}h后", left / 3600)
-                                                }
-                                            );
-                                        }
-                                        ui.label(
-                                            egui::RichText::new(tail).weak().small(),
-                                        );
-                                    });
+                                    quota_line(
+                                        ui,
+                                        label.trim_start_matches('_'),
+                                        *pct,
+                                        *resets,
+                                        *used,
+                                        *lim,
+                                    );
                                 }
                             }
                             ui.add_space(2.0);
@@ -1106,8 +1253,17 @@ impl eframe::App for Panel {
                     ui.add_space(6.0);
                 }
 
-                // ---- Token 构成卡片（按当前应用）
+                // ---- Token 构成卡片（按当前应用；"all" 为双源合并）
                 card(ui, |ui| {
+                    let mut combined = self.st.total_all.clone();
+                    for ap in self.st.apps.values() {
+                        let a = &ap.total_all;
+                        combined.sessions += a.sessions;
+                        combined.tin += a.tin;
+                        combined.tout += a.tout;
+                        combined.tcr += a.tcr;
+                        combined.tcw += a.tcw;
+                    }
                     let t = match self.tab {
                         "devin" => &self.st.total_all,
                         key => self
@@ -1115,7 +1271,7 @@ impl eframe::App for Panel {
                             .apps
                             .get(key)
                             .map(|a| &a.total_all)
-                            .unwrap_or(&self.st.total_all),
+                            .unwrap_or(&combined),
                     };
                     let sum = t.tin + t.tout + t.tcr + t.tcw;
                     ui.horizontal(|ui| {
@@ -1136,26 +1292,33 @@ impl eframe::App for Panel {
 
                 // ---- 模型族卡片（按当前应用）
                 card(ui, |ui| {
-                    let (models, note): (&[ModelRow], &str) = match self.tab {
+                    let (models, note): (Vec<ModelRow>, &str) = match self.tab {
                         "devin" => (
-                            &self.st.all_models,
+                            self.st.all_models.clone(),
                             "gpt-6-astra / gpt-5-6-* 等为 Devin 内部模型，无公开价，按 gpt 档折算",
                         ),
-                        "cursor" => (
+                        "all" => (
                             self.st
-                                .apps
-                                .get("cursor")
-                                .map(|a| a.models.as_slice())
-                                .unwrap_or(&[]),
-                            "Cost=Included 为订阅内用量；估算按 API 刊例价折算",
+                                .all_models
+                                .iter()
+                                .cloned()
+                                .chain(self.st.apps.values().flat_map(|a| {
+                                    a.models.iter().cloned()
+                                }))
+                                .collect(),
+                            "全部应用合并视图；各应用计费/订阅独立，成本仅作量级参考",
                         ),
-                        _ => (
+                        key => (
                             self.st
                                 .apps
-                                .get("antigravity")
-                                .map(|a| a.models.as_slice())
-                                .unwrap_or(&[]),
-                            "本地生成记录的 token 统计；按模型 API 价折算",
+                                .get(key)
+                                .map(|a| a.models.clone())
+                                .unwrap_or_default(),
+                            if key == "cursor" {
+                                "Cost=Included 为订阅内用量；估算按 API 刊例价折算"
+                            } else {
+                                "本地记录的 token 统计；按模型 API 价折算"
+                            },
                         ),
                     };
                     ui.horizontal(|ui| {
@@ -1177,7 +1340,7 @@ impl eframe::App for Panel {
                                 .weak(),
                         );
                     } else {
-                        self.model_table(ui, models, note);
+                        self.model_table(ui, &models, note);
                     }
                 });
                 ui.add_space(6.0);

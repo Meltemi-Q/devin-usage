@@ -86,6 +86,7 @@ pub struct Agg {
     pub tcw: i64,   // cache-write tokens
 }
 
+#[derive(Clone)]
 pub struct ModelRow {
     pub source: String,
     pub model: String,
@@ -261,7 +262,7 @@ pub fn load_stats() -> Stats {
         )
         .unwrap_or_default();
     // devin 系总计（排除 cursor/antigravity——各应用套餐独立，不混计）
-    const DEVIN_SRC: &str = "source NOT IN ('cursor','antigravity')";
+    const DEVIN_SRC: &str = "source NOT IN ('cursor','antigravity','zcode','grok')";
     st.total_7d = conn
         .query_row(
             &format!("{SEL} WHERE {DEVIN_SRC} AND created_at>=?1"),
@@ -337,7 +338,7 @@ pub fn load_stats() -> Stats {
                         sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
                         FROM local_sessions";
     if let Ok(mut stmt) = conn.prepare(&format!(
-        "{SELSM} WHERE source NOT IN ('cursor','antigravity') GROUP BY source, model
+        "{SELSM} WHERE source NOT IN ('cursor','antigravity','zcode','grok') GROUP BY source, model
          ORDER BY sum(ifnull(tok_in,0)+ifnull(tok_out,0)+ifnull(tok_cache_read,0)+ifnull(tok_cache_write,0)) DESC
          LIMIT 200"
     )) {
@@ -361,11 +362,11 @@ pub fn load_stats() -> Stats {
         }
     }
     // 其他应用：独立统计（各应用套餐独立，绝不混入 devin 数字）
-    for app in ["cursor", "antigravity"] {
+    for app in ["cursor", "antigravity", "zcode", "grok"] {
         st.apps.insert(app.to_string(), load_app_stats(&conn, app, t7, &rules));
     }
     if let Ok(mut stmt) =
-        conn.prepare(&format!("{SELSM} WHERE source NOT IN ('cursor','antigravity') AND created_at>=?1 GROUP BY source, model"))
+        conn.prepare(&format!("{SELSM} WHERE source NOT IN ('cursor','antigravity','zcode','grok') AND created_at>=?1 GROUP BY source, model"))
     {
         if let Ok(rows) = stmt.query_map([t7], |r| {
             Ok((

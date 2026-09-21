@@ -978,6 +978,182 @@ def collect_antigravity_quota(c) -> int:
     return n
 
 
+# ---------------------------------------------------------------- zcode / grok
+
+def _read_jsonl_incremental(c, app: str, path: Path):
+    """JSONL 只增不改：按 kv 里的字节偏移续读新行。产出解析后的 dict。"""
+    key = f"off:{app}:{path}"
+    off = 0
+    try:
+        row = c.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        off = int(row[0]) if row else 0
+    except Exception:
+        pass
+    size = path.stat().st_size
+    if off > size:                               # 文件被截断/轮转 → 重读
+        off = 0
+    if off == size:
+        return
+    with open(path, "rb") as f:
+        f.seek(off)
+        chunk = f.read()
+    c.execute("INSERT OR REPLACE INTO kv VALUES(?,?)", (key, str(size)))
+    for raw in chunk.decode("utf-8", "replace").splitlines():
+        if not raw.strip():
+            continue
+        try:
+            yield json.loads(raw)
+        except Exception:
+            continue
+
+
+def _iso_ts(s) -> "int | None":
+    try:
+        return int(datetime.fromisoformat(
+            str(s).replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
+
+
+def collect_zcode(c) -> int:
+    """~/.zcode/cli/agents/*/*/transcript.jsonl → usage_events + local_sessions。
+    model_request 带模型名(uuid/name)，model_complete 带 usage，按 turnId 关联。"""
+    files = sorted(Path.home().glob(".zcode/cli/agents/*/*/transcript.jsonl"))
+    if not files:
+        log_run(c, "zcode", "skip", "无 transcript.jsonl")
+        return 0
+    n_ev = 0
+    sess = {}                                    # sessionId → 聚合
+    for p in files:
+        try:
+            turn_model = {}                      # turnId → model（本文件内）
+            for e in _read_jsonl_incremental(c, "zcode", p):
+                t, pay = e.get("type"), e.get("payload") or {}
+                sid = e.get("sessionId") or p.parent.stem
+                ts = _iso_ts(e.get("timestamp"))
+                if t == "model_request":
+                    m = pay.get("model") or ""
+                    turn_model[e.get("turnId") or ""] = m.split("/")[-1] or m
+                elif t == "model_complete":
+                    u = pay.get("usage") or {}
+                    if not u.get("totalTokens"):
+                        continue
+                    model = turn_model.get(e.get("turnId") or "", "?")
+                    day = (datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                           if ts else "1970-01-01")
+                    cur = c.execute("""INSERT OR IGNORE INTO usage_events
+                        (app,event_key,ts,day,model,kind,session_id,
+                         tok_in,tok_out,tok_cache_read,tok_cache_write,cost_usd,meta)
+                        VALUES('zcode',?,?,?,?,'gen',?,?,?,?,?,NULL,?)""",
+                        (e.get("id") or str(uuid.uuid4()), ts or 0, day, model,
+                         f"zcode:{sid}",
+                         u.get("inputTokens") or 0, u.get("outputTokens") or 0,
+                         u.get("cacheReadTokens") or 0,
+                         u.get("cacheWriteTokens") or 0,
+                         json.dumps({"querySource": pay.get("querySource")})))
+                    n_ev += cur.rowcount
+                    s = sess.setdefault(sid, {"model": model, "n": 0,
+                                              "t0": ts or 0, "t1": ts or 0,
+                                              "ti": 0, "to": 0, "tcr": 0})
+                    s["n"] += 1
+                    s["model"] = model if model != "?" else s["model"]
+                    s["t0"] = min(s["t0"], ts or s["t0"])
+                    s["t1"] = max(s["t1"], ts or s["t1"])
+                    s["ti"] += u.get("inputTokens") or 0
+                    s["to"] += u.get("outputTokens") or 0
+                    s["tcr"] += u.get("cacheReadTokens") or 0
+        except Exception:
+            continue
+    now = int(time.time())
+    n_sess = 0
+    for sid, s in sess.items():
+        c.execute("""INSERT INTO local_sessions
+            (session_id,source,model,title,created_at,last_activity_at,
+             n_user,n_assistant,n_tool,n_system,n_tool_calls,n_prompts,
+             tok_in,tok_out,tok_cache_read,tok_cache_write,first_seen,last_seen)
+            VALUES (?, 'zcode', ?, ?, ?, ?, 0, ?, 0,0,0,0, ?,?,?,0, ?,?)
+            ON CONFLICT(session_id) DO UPDATE SET
+             model=excluded.model, last_activity_at=excluded.last_activity_at,
+             n_assistant=excluded.n_assistant, tok_in=excluded.tok_in,
+             tok_out=excluded.tok_out, tok_cache_read=excluded.tok_cache_read,
+             last_seen=excluded.last_seen""",
+            (f"zcode:{sid}", s["model"], sid, s["t0"], s["t1"], s["n"],
+             s["ti"], s["to"], s["tcr"], now, now))
+        n_sess += 1
+    log_run(c, "zcode", "ok", f"{n_sess} sessions, +{n_ev} events")
+    return n_sess
+
+
+def collect_grok(c) -> int:
+    """~/.grok/sessions/*/*/{updates.jsonl,summary.json} → usage_events + local_sessions。
+    turn_completed.usage 含全量 token + costUsdTicks(1e-9 USD) + modelUsage 分模型。"""
+    roots = Path.home() / ".grok/sessions"
+    if not roots.exists():
+        log_run(c, "grok", "skip", "~/.grok/sessions 不存在")
+        return 0
+    n_ev = n_sess = 0
+    for upd in roots.glob("*/*/updates.jsonl"):
+        try:
+            for e in _read_jsonl_incremental(c, "grok", upd):
+                u = (e.get("params") or {}).get("update") or {}
+                if u.get("sessionUpdate") != "turn_completed":
+                    continue
+                usage = u.get("usage") or {}
+                if not usage.get("totalTokens"):
+                    continue
+                sid = (e.get("params") or {}).get("sessionId") or upd.parent.name
+                ts = e.get("timestamp") or 0
+                day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                pid = u.get("prompt_id") or str(uuid.uuid4())
+                mu = usage.get("modelUsage") or {}
+                items = mu.items() if mu else [("?", usage)]
+                for model, mu1 in items:
+                    cost = mu1.get("costUsdTicks")
+                    cur = c.execute("""INSERT OR IGNORE INTO usage_events
+                        (app,event_key,ts,day,model,kind,session_id,
+                         tok_in,tok_out,tok_cache_read,tok_cache_write,cost_usd,meta)
+                        VALUES('grok',?,?,?,?,'gen',?,?,?,?,?,?,?)""",
+                        (f"{sid}:{pid}:{model}", ts, day, model,
+                         f"grok:{sid}",
+                         mu1.get("inputTokens") or 0,
+                         mu1.get("outputTokens") or 0,
+                         mu1.get("cachedReadTokens") or 0,
+                         mu1.get("cacheCreationTokens") or 0,
+                         (cost / 1e9) if isinstance(cost, (int, float)) else None,
+                         json.dumps({"modelCalls": mu1.get("modelCalls"),
+                                     "apiMs": mu1.get("apiDurationMs"),
+                                     "reasoning": mu1.get("reasoningTokens")})))
+                    n_ev += cur.rowcount
+        except Exception:
+            continue
+    # 会话级：summary.json
+    now = int(time.time())
+    for sm in roots.glob("*/*/summary.json"):
+        try:
+            j = json.loads(sm.read_text(encoding="utf-8"))
+            sid = (j.get("info") or {}).get("id") or sm.parent.name
+            t0 = _iso_ts(j.get("created_at"))
+            t1 = _iso_ts(j.get("last_active_at") or j.get("updated_at"))
+            c.execute("""INSERT INTO local_sessions
+                (session_id,source,model,title,cwd,created_at,last_activity_at,
+                 n_user,n_assistant,n_tool,n_system,n_tool_calls,n_prompts,
+                 tok_in,tok_out,tok_cache_read,tok_cache_write,first_seen,last_seen)
+                VALUES (?, 'grok', ?, ?, ?, ?, ?, ?, 0,0,0,0,0, 0,0,0,0, ?,?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                 model=excluded.model, title=excluded.title,
+                 last_activity_at=excluded.last_activity_at,
+                 n_user=excluded.n_user, last_seen=excluded.last_seen""",
+                (f"grok:{sid}", j.get("current_model_id") or "?",
+                 j.get("session_summary") or sid,
+                 (j.get("info") or {}).get("cwd") or "",
+                 t0 or 0, t1 or 0, j.get("num_messages") or 0, now, now))
+            n_sess += 1
+        except Exception:
+            continue
+    log_run(c, "grok", "ok", f"{n_sess} sessions, +{n_ev} events")
+    return n_sess
+
+
 # 等效价格表（每 1M token 美元，prefix 首个命中者胜；"" 为兜底）
 # 公开 API 刊例价；swe-2 无公开价，默认按 Sonnet 档折算。
 # 可在 data/prices.json 覆盖/新增：{"rules":[["prefix",in,out,cr,cw],...]}
@@ -992,6 +1168,8 @@ BUILTIN_PRICES = [
     ("deepseek",     0.27,  1.10, 0.07,  0.27, ""),
     ("kimi",         0.60,  2.50, 0.15,  0.60, ""),
     ("grok",         3.00, 15.00, 0.30,  3.75, "proxy:frontier"),
+    ("glm",          0.60,  2.20, 0.11,  0.55, "z.ai"),
+    ("fable",        3.00, 15.00, 0.30,  3.75, "proxy:sonnet"),
     ("",             3.00, 15.00, 0.30,  3.75, "default:sonnet"),
 ]
 
@@ -1060,7 +1238,9 @@ def cmd_collect(args):
                      ("cloud", lambda: collect_cloud(c, token, org)),
                      ("local", lambda: collect_local(c)),
                      ("cursor", lambda: collect_cursor(c)),
-                     ("antigravity", lambda: collect_antigravity(c))):
+                     ("antigravity", lambda: collect_antigravity(c)),
+                     ("zcode", lambda: collect_zcode(c)),
+                     ("grok", lambda: collect_grok(c))):
         if args.only and name != args.only:
             continue
         if name in ("quota", "cloud") and not token:
@@ -1147,7 +1327,7 @@ def cmd_report(args):
                       sum(last_activity_at - created_at), sum(credit_cost), sum(acu_cost),
                       sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
                       FROM local_sessions WHERE created_at>=?
-                      AND source NOT IN ('cursor','antigravity')
+                      AND source NOT IN ('cursor','antigravity','zcode','grok')
                       GROUP BY source, model
                       ORDER BY 3 DESC""", (since,)).fetchall()
     out["local_by_model"] = [
@@ -1163,7 +1343,7 @@ def cmd_report(args):
                        sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
                        FROM local_sessions
                        WHERE created_at>=?
-                       AND source NOT IN ('cursor','antigravity')""",
+                       AND source NOT IN ('cursor','antigravity','zcode','grok')""",
                        (since,)).fetchone()
     out["local_totals"] = {"sessions": tot[0] or 0, "user_msgs": tot[1] or 0,
                            "tool_calls": tot[2] or 0,

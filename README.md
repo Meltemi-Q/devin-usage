@@ -27,7 +27,8 @@ Windows + macOS + Linux（含无头 VPS）。
 
 - `devin_usage.py`：单文件 Python（**仅标准库**），采集 + 报表 + 实时监控
 - `devin-usage-tray`：Rust 托盘图标，60s 刷新配额/SWE-2 用量，图标随配额变色
-- **多应用覆盖**：Devin App/CLI/Cloud + Cursor + Antigravity
+- **多应用覆盖**：Devin App/CLI/Cloud + Cursor + Antigravity + ZCode + Grok；
+  面板顶部 Tab 完全隔离（各应用套餐/配额/计费独立），另有"总览"Tab 横向对比
 - 数据存自己的 `data/usage.db`，对各应用的库**只读不写**；token 运行时现读，
   重新登录自动生效；采集幂等可反复跑
 
@@ -62,6 +63,21 @@ Windows + macOS + Linux（含无头 VPS）。
 | 配额 | 本机 language server `127.0.0.1:port`（进程命令行 `--app_data_dir antigravity` + `--csrf_token` 定位，netstat/lsof 找端口，POST `GetUserStatus`/`GetCommandModelConfigs`） | **每模型配额**：`quotaInfo{remainingFraction,resetTime}`；仅 IDE 运行时可用，IDE 关闭记 skip |
 
 配额快照存 `app_quota` 表（app+label+ts 幂等），面板各应用 Tab 顶部显示进度条和重置倒计时。
+
+### ZCode
+
+| 源 | 位置 | 采到什么 |
+|---|---|---|
+| 会话转录 | `~/.zcode/cli/agents/*/*/transcript.jsonl`（增量读：kv 记字节偏移，JSONL 只增不改） | `model_complete.usage{input/output/cacheRead/cacheWriteTokens}` 真实 token；模型名由同 turn 的 `model_request.payload.model` 关联（`uuid/name` 取末段） |
+
+### Grok（grok CLI / grok-build）
+
+| 源 | 位置 | 采到什么 |
+|---|---|---|
+| 会话更新流 | `~/.grok/sessions/*/*/updates.jsonl`（增量读） | `turn_completed.usage{input/output/cachedRead/cacheCreationTokens, modelCalls, apiDurationMs}` + **`costUsdTicks` 真实成本**（1e-9 USD）+ `modelUsage` 分模型明细 |
+| 会话元数据 | `~/.grok/sessions/*/*/summary.json` | 模型、cwd、消息数、起止时间 |
+
+ZCode / Grok 无公开配额接口，面板显示"无配额口径"。
 
 解码方法参考开源实现 [openusage#1139](https://github.com/robinebers/openusage/pull/1139)。
 `.pb` 旧格式/加密文件跳过。
