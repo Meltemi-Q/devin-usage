@@ -1058,11 +1058,12 @@ fn main() {
             return;
         }
         Some("export") => {
-            let for_dev = args
-                .windows(2)
-                .find(|w| w[0] == "--for")
-                .map(|w| w[1].as_str());
-            agent::export_cli(for_dev);
+            let opt = |f: &str| {
+                args.windows(2)
+                    .find(|w| w[0] == f)
+                    .map(|w| w[1].as_str())
+            };
+            agent::export_cli(opt("--for"), opt("--since"));
             return;
         }
         Some("import") => {

@@ -1,8 +1,9 @@
 # devin-usage
 
-Devin App / CLI / Cloud 的本地用量统计 + 系统托盘工具。
+Devin / Cursor / Antigravity / ZCode / Grok / Claude Code 的本地用量统计 +
+系统托盘工具，跨设备汇总。
 
-逆向自 Devin Desktop 的真实数据面：**配额余额、云端 ACU、本地每个会话的真实
+逆向自各应用的真实数据面：**配额余额、云端 ACU、每个会话的真实
 token（输入/输出/缓存读/缓存写）、按模型等效美元折算**。
 Windows + macOS + Linux（含无头 VPS）。
 
@@ -20,15 +21,18 @@ Windows + macOS + Linux（含无头 VPS）。
 笔记本睡醒自然续上），任务计划/cron 是托盘没跑时的备份。
 界面刷新每 60s；"立即采集"立即触发一轮。
 
-前置要求：Python 3（仅标准库）；托盘需要 Rust 工具链构建
-（`cd devin-usage-tray && cargo build --release`），不构建则只装采集。
+前置要求：**只需 Rust 工具链**（`cd devin-usage-tray && cargo build --release`），
+单个静态二进制完成采集+同步+托盘+面板。`devin_usage.py` 保留为兼容参考实现，
+常规使用不再需要 Python。
 
 ## 功能
 
-- `devin_usage.py`：单文件 Python（**仅标准库**），采集 + 报表 + 实时监控
-- `devin-usage-tray`：Rust 托盘图标，60s 刷新配额/SWE-2 用量，图标随配额变色
-- **多应用覆盖**：Devin App/CLI/Cloud + Cursor + Antigravity + ZCode + Grok；
-  面板顶部 Tab 完全隔离（各应用套餐/配额/计费独立），另有"总览"Tab 横向对比
+- `devin-usage-tray`：Rust 单二进制——托盘图标（60s 刷新配额、图标随配额变色）
+  + 内置 15min 自动采集 + `--panel` 可视化面板 + `collect/export/import/sync` 子命令
+- **多应用覆盖**：Devin App/CLI/Cloud + Cursor + Antigravity + ZCode + Grok +
+  Claude Code；面板顶部 Tab 完全隔离（各应用套餐/配额/计费独立），另有"总览"Tab
+- **多设备汇总**：每行数据打 `device` 标签（hostname），SSH 双向同步到 VPS 中心库；
+  面板设备选择器 `全部 / Win / Mac / VPS` 切换，离线也能看所有设备
 - 数据存自己的 `data/usage.db`，对各应用的库**只读不写**；token 运行时现读，
   重新登录自动生效；采集幂等可反复跑
 
@@ -77,7 +81,26 @@ Windows + macOS + Linux（含无头 VPS）。
 | 会话更新流 | `~/.grok/sessions/*/*/updates.jsonl`（增量读） | `turn_completed.usage{input/output/cachedRead/cacheCreationTokens, modelCalls, apiDurationMs}` + **`costUsdTicks` 真实成本**（1e-9 USD）+ `modelUsage` 分模型明细 |
 | 会话元数据 | `~/.grok/sessions/*/*/summary.json` | 模型、cwd、消息数、起止时间 |
 
-ZCode / Grok 无公开配额接口，面板显示"无配额口径"。
+ZCode 无公开配额接口，面板显示"无配额口径"。
+
+### Grok（grok CLI / grok-build）
+
+|| 源 | 位置 | 采到什么 |
+|---|---|---|---|
+|| 会话更新流 | `~/.grok/sessions/*/*/updates.jsonl`（增量读） | `turn_completed.usage{input/output/cachedRead/cacheCreationTokens, modelCalls, apiDurationMs}` + **`costUsdTicks` 真实成本**（1e-9 USD）+ `modelUsage` 分模型明细 |
+|| 会话元数据 | `~/.grok/sessions/*/*/summary.json` | 模型、cwd、消息数、起止时间 |
+|| 配额 | `GET cli-chat-proxy.grok.com/v1/billing?format=credits`（access token 读 `~/.grok/auth.json`，仅在未过期时探测，刷新交给 CLI） | **周额度**已用%、`productUsage` 分产品（GrokChat/GrokBuild）、套餐名、`currentPeriod` 重置时间 |
+
+注意：grok/zcode 的 `inputTokens` **已含缓存读**，采集时已扣除避免重复计。
+
+### Claude Code
+
+|| 源 | 位置 | 采到什么 |
+|---|---|---|---|
+|| 会话转录 | `~/.claude/projects/*/*.jsonl`（增量读字节偏移） | 每条 assistant 消息的 `message.usage`：input/output/cache_read/cache_creation 真实 token + 模型名；按 `message.id` 去重（流式重发只计一次） |
+
+Claude 的 `input_tokens` 本身不含缓存（与 grok 相反），无需扣除。
+注意：Claude Code 会清理旧 transcript，本地只保留近期会话的 token 明细。
 
 解码方法参考开源实现 [openusage#1139](https://github.com/robinebers/openusage/pull/1139)。
 `.pb` 旧格式/加密文件跳过。
@@ -85,7 +108,28 @@ ZCode / Grok 无公开配额接口，面板显示"无配额口径"。
 ## 用法
 
 ```bash
-python devin_usage.py collect          # 采集一轮（~30s，幂等；--only 可单采某源）
+devin-usage-tray collect          # 采集一轮（幂等；末尾自动 ssh 同步到配置的 peer）
+devin-usage-tray export > x.ndjson   # 增量导出（kv 游标水位；--since ts 显式水位）
+devin-usage-tray import < x.ndjson   # 导入 NDJSON（INSERT OR IGNORE 幂等）
+devin-usage-tray sync             # 双向同步：先推本地增量给 peer，再拉回 peer 数据
+```
+
+同步配置（写在本地库 kv 表，或用环境变量）：
+
+```bash
+# 在库里配置一次：
+sqlite3 data/usage.db "INSERT OR REPLACE INTO kv VALUES('sync.peer','vps');"
+sqlite3 data/usage.db "INSERT OR REPLACE INTO kv VALUES('sync.remote','/root/devin-usage');"
+# sync.peer = ssh 别名（~/.ssh/config 里的 Host）；sync.remote = 对端项目目录
+```
+
+架构：`Win/Mac ──push/pull──> VPS(中心库)`，VPS 自身也跑 collect 采 CLI 类数据。
+每行带 `device` 标签；账号级数据（Cursor CSV、Grok 配额）按 event_key 天然去重。
+
+Python 兼容实现（保留，功能相同）：
+
+```bash
+python devin_usage.py collect          # 采集一轮（--only 可单采某源）
 python devin_usage.py report           # 全部汇总；--today/--week/--month/--json
 python devin_usage.py quota            # 配额快照 + 最近趋势
 python devin_usage.py sessions -n 20   # 会话明细（本地+云端）
@@ -124,16 +168,19 @@ cd devin-usage-tray && cargo build --release
 # macOS:   target/release/devin-usage-tray
 ```
 
-**面板模式**（`--panel`）：egui 轻量窗口——顶部 Devin / Cursor / Antigravity
-三个 Tab，各应用套餐/配额/计费完全独立、互不混计：
+**面板模式**（`--panel`）：egui 轻量窗口——顶部 Devin / Cursor / Antigravity /
+ZCode / Grok / Claude / 总览 Tab，各应用套餐/配额/计费完全独立、互不混计；
+第二行**设备选择器**（全部 / 各 hostname）过滤全部图表与配额：
 
 - **Devin**：配额进度条 + 配额趋势线（仅 Devin 有配额概念）、SWE-2 汇总、
   每日 token 堆叠柱、分模型族/具体型号表、等效成本
 - **Cursor**：套餐（plan）+ 会话/请求概要、每日 token 柱（usage_events 事件级）、
   分模型表（含订阅外实扣）、行级采纳统计
-- **Antigravity**：会话/生成概要、每日 token 柱、分模型表、按 API 价折算
+- **Antigravity**：周+5h 双配额进度条、会话/生成概要、每日 token 柱、分模型表
+- **ZCode / Grok / Claude**：会话/事件概要、每日 token 柱、分模型表；
+  Grok 额外有周配额条和真实扣费合计
 
-每个 Tab 的图表/构成条/模型表/底部成本行都只统计所选应用。
+每个 Tab 的图表/构成条/模型表/底部成本行都只统计所选应用与所选设备。
 [立即采集]/[复制报告]/[置顶] 固定底栏。适合菜单栏拥挤图标被系统隐藏、
 或想要桌面小组件的场景；托盘菜单"打开面板"可直接唤起。
 

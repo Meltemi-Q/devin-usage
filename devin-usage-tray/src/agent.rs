@@ -2073,15 +2073,21 @@ fn sync_prices(c: &Connection) {
 
 // ---------------------------------------------------------------- sync
 
-/// 各表增量导出的水位列/游标方式。
-fn export_table_rows(c: &Connection, table: &str, cursor_key: &str, exclude_dev: Option<&str>) -> Vec<Value> {
+/// 各表增量导出的水位列/游标方式。wm=已确认送达的水位（None=从头）；
+/// 返回 (rows, 新水位)。游标不落 kv——由调用方在确认送达后提交，
+/// 避免"水位推进了但数据没送到"的丢行。
+fn export_table_rows(
+    c: &Connection,
+    table: &str,
+    wm: Option<i64>,
+    exclude_dev: Option<&str>,
+) -> (Vec<Value>, Option<i64>) {
     let dev_filter = exclude_dev.map(|d| format!("AND device != '{}'", d.replace('\'', "")));
     let mut rows = Vec::new();
     match table {
-        // rowid 游标（insert-only 或 replace-bumps-rowid）
+        // rowid 水位（insert-only 或 replace-bumps-rowid）
         "usage_events" | "app_quota" | "quota_snapshots" => {
-            let cur_key = format!("exp:{cursor_key}:{table}");
-            let cur: i64 = kv_get(c, &cur_key).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let cur = wm.unwrap_or(0);
             let cols = match table {
                 "usage_events" => "rowid,app,event_key,ts,day,model,kind,session_id,tok_in,tok_out,tok_cache_read,tok_cache_write,cost_usd,meta,device",
                 "app_quota" => "rowid,app,label,ts,pct_remaining,used,lim,resets_at,meta,device",
@@ -2107,14 +2113,11 @@ fn export_table_rows(c: &Connection, table: &str, cursor_key: &str, exclude_dev:
                     }
                 }
             }
-            if maxrid > cur {
-                kv_set(c, &cur_key, &maxrid.to_string());
-            }
+            return (rows, Some(maxrid));
         }
         // last_seen 水位（upsert 原地更新）
         "local_sessions" | "cloud_sessions" => {
-            let cur_key = format!("exp:{cursor_key}:{table}");
-            let cur: i64 = kv_get(c, &cur_key).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let cur = wm.unwrap_or(0);
             let cols = match table {
                 "local_sessions" => "session_id,source,model,agent_mode,backend_type,cwd,title,created_at,last_activity_at,credit_cost,acu_cost,n_user,n_assistant,n_tool,n_system,n_tool_calls,n_prompts,tok_in,tok_out,tok_cache_read,tok_cache_write,gen_ms,device,last_seen",
                 _ => "session_id,title,status,status_detail,origin,category,user_id,created_at,updated_at,acus_consumed,n_prs,device,last_seen",
@@ -2141,9 +2144,7 @@ fn export_table_rows(c: &Connection, table: &str, cursor_key: &str, exclude_dev:
                     }
                 }
             }
-            if maxls > cur {
-                kv_set(c, &cur_key, &maxls.to_string());
-            }
+            return (rows, Some(maxls));
         }
         // 小表全量
         "daily_activity" | "model_multipliers" => {
@@ -2168,7 +2169,7 @@ fn export_table_rows(c: &Connection, table: &str, cursor_key: &str, exclude_dev:
         }
         _ => {}
     }
-    rows
+    (rows, None)
 }
 
 const SYNC_TABLES: &[&str] = &[
@@ -2176,19 +2177,45 @@ const SYNC_TABLES: &[&str] = &[
     "app_quota", "quota_snapshots", "daily_activity", "model_multipliers",
 ];
 
-/// `export [--for <dev>]`：NDJSON → stdout。每行 {"t":表名,"r":{...}}。
-pub fn export_cli(for_dev: Option<&str>) {
+/// `export [--for <dev>] [--since t=v,...]`：NDJSON → stdout。
+/// 每行 {"t":表名,"r":{...}}。--since 由拉取方传它已确认的水位；
+/// 不传则从 kv exp:for:<dev>:<table> 取水位并在输出后提交。
+pub fn export_cli(for_dev: Option<&str>, since: Option<&str>) {
     let Some(c) = open_db() else { return };
     tag_device(&c);
-    let cur_key = for_dev.map(|d| format!("for:{d}")).unwrap_or_else(|| "self".into());
+    let since_map: std::collections::HashMap<String, i64> = since
+        .map(|s| {
+            s.split(',')
+                .filter_map(|p| {
+                    let mut it = p.splitn(2, '=');
+                    Some((it.next()?.to_string(), it.next()?.parse().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let out = std::io::stdout();
     let mut w = out.lock();
     for t in SYNC_TABLES {
-        for r in export_table_rows(&c, t, &cur_key, for_dev) {
+        let key = format!("exp:for:{}:{t}", for_dev.unwrap_or("self"));
+        let wm = since_map
+            .get(*t)
+            .copied()
+            .or_else(|| kv_get(&c, &key).and_then(|s| s.parse().ok()));
+        let (rows, new_wm) = export_table_rows(&c, t, wm, for_dev);
+        for r in &rows {
             let line = json!({"t": t, "r": r});
             let _ = writeln!(w, "{line}");
         }
+        // --since 模式下游标归拉方管；否则写 kv（已尽力送达）
+        if since.is_none() {
+            if let Some(m) = new_wm {
+                if Some(m) > wm {
+                    kv_set(&c, &key, &m.to_string());
+                }
+            }
+        }
     }
+    let _ = w.flush();
 }
 
 fn import_row(c: &Connection, t: &str, r: &serde_json::Map<String, Value>) {
@@ -2311,33 +2338,49 @@ pub fn import_cli() {
 /// `sync`：与 kv sync.peer 配置的 ssh 对端双向同步。
 /// 配置：kv sync.peer=vps（ssh别名），sync.remote=远程项目目录。
 pub fn sync_cli() {
-    let Some(c) = open_db() else { return };
+    let Some(mut c) = open_db() else { return };
     let Some(peer) = kv_get(&c, "sync.peer") else {
         eprintln!("sync: 未配置 sync.peer");
         return;
     };
     let remote = kv_get(&c, "sync.remote").unwrap_or_else(|| "~/devin-usage".into());
-    // 远程优先用 Rust agent 二进制；不存在退回 python（过渡期）
-    let remote_cmd = format!(
-        "test -x {r}/devin-usage-tray/target/release/devin-usage-tray && {r}/devin-usage-tray/target/release/devin-usage-tray || python3 {r}/devin_usage.py",
-        r = remote
-    );
-    // 1) 推：本地 export（游标按目标分：exp:to:<peer>:*）→ 对端 import
+    // 远程优先用 Rust agent 二进制；不存在退回 python（过渡期）。
+    // 注意必须 if/else 分组——`test && X || Y` 会把子命令参数绑错边。
+    let remote_cmd = |sub: &str| {
+        format!(
+            "BIN={r}/devin-usage-tray/target/release/devin-usage-tray; \
+             if [ -x \"$BIN\" ]; then \"$BIN\" {sub}; \
+             else python3 {r}/devin_usage.py {sub}; fi",
+            r = remote
+        )
+    };
+    // 1) 推：本地增量 → 对端 import；成功后提交 exp:to:<peer>:<表> 游标
     let mut buf = Vec::new();
+    let mut wms: Vec<(&str, i64, i64)> = Vec::new(); // (表, 旧水位, 新水位)
     {
         let mut w = std::io::BufWriter::new(&mut buf);
         for t in SYNC_TABLES {
-            for r in export_table_rows(&c, t, &format!("to:{peer}"), None) {
+            let wm = kv_get(&c, &format!("exp:to:{peer}:{t}"))
+                .and_then(|s| s.parse().ok());
+            let (rows, new_wm) = export_table_rows(&c, t, wm, None);
+            for r in &rows {
                 let line = json!({"t": t, "r": r}).to_string();
                 let _ = w.write_all(line.as_bytes());
                 let _ = w.write_all(b"\n");
+            }
+            if let (Some(old), Some(new)) = (wm, new_wm) {
+                if new > old {
+                    wms.push((t, old, new));
+                }
+            } else if let (None, Some(new)) = (wm, new_wm) {
+                wms.push((t, 0, new));
             }
         }
         let _ = w.flush();
     }
     if !buf.is_empty() {
         if let Ok(mut ch) = Command::new("ssh")
-            .args([&peer, &format!("{remote_cmd} import")])
+            .args([&peer, &remote_cmd("import")])
             .stdin(std::process::Stdio::piped())
             .spawn()
         {
@@ -2346,23 +2389,62 @@ pub fn sync_cli() {
                     let _ = si.write_all(&buf);
                 }
             } // stdin drop → EOF → 对端 import 读完
-            let _ = ch.wait();
+            if ch.wait().map(|s| s.success()).unwrap_or(false) {
+                for (t, _, new) in &wms {
+                    kv_set(&c, &format!("exp:to:{peer}:{t}"), &new.to_string());
+                }
+                eprintln!("sync -> {peer}: {} rows", String::from_utf8_lossy(&buf).lines().count());
+            }
         }
     }
-    // 2) 拉：对端 export --for <me> → 本地 import
+    // 2) 拉：本地水位 have:<peer>:<表> 发给对端 → 导入后提交
     let me = device();
+    let since_arg = SYNC_TABLES
+        .iter()
+        .filter_map(|t| {
+            kv_get(&c, &format!("have:{peer}:{t}"))
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(|v| format!("{t}={v}"))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let sub = if since_arg.is_empty() {
+        format!("export --for {me}")
+    } else {
+        format!("export --for {me} --since {since_arg}")
+    };
     if let Ok(o) = Command::new("ssh")
-        .args([&peer, &format!("{remote_cmd} export --for {me}")])
+        .args([&peer, &remote_cmd(&sub)])
         .output()
     {
         let txt = String::from_utf8_lossy(&o.stdout);
         let mut n = 0;
-        for line in txt.lines() {
-            if let Ok(e) = serde_json::from_str::<Value>(line) {
-                if let (Some(t), Some(r)) = (vstr(&e, "t"), e["r"].as_object()) {
-                    import_row(&c, &t, r);
-                    n += 1;
+        let mut max_wm: std::collections::HashMap<String, i64> = Default::default();
+        {
+            let Ok(tx) = c.transaction() else { return };
+            for line in txt.lines() {
+                if let Ok(e) = serde_json::from_str::<Value>(line) {
+                    if let (Some(t), Some(r)) = (vstr(&e, "t"), e["r"].as_object()) {
+                        import_row(&tx, &t, r);
+                        // 行里的水位字段：rowid 表取 rowid，会话表取 last_seen
+                        let wm_v = r.get("rowid").or_else(|| r.get("last_seen"))
+                            .and_then(opt_i64);
+                        if let Some(v) = wm_v {
+                            let e = max_wm.entry(t).or_insert(0);
+                            *e = (*e).max(v);
+                        }
+                        n += 1;
+                    }
                 }
+            }
+            let _ = tx.commit();
+        }
+        for (t, m) in max_wm {
+            let cur: i64 = kv_get(&c, &format!("have:{peer}:{t}"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if m > cur {
+                kv_set(&c, &format!("have:{peer}:{t}"), &m.to_string());
             }
         }
         if n > 0 {

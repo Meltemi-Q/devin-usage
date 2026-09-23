@@ -1,5 +1,7 @@
 #!/bin/bash
 # install-agent-macos.sh — macOS: launchd 托盘常驻 + crontab 定时采集
+# 采集器是 Rust 二进制 devin-usage-tray（托盘进程本身也会每 15min 自采一轮，
+# crontab 只是冗余兜底）；不再需要 python。
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 TRAY="$DIR/devin-usage-tray/target/release/devin-usage-tray"
@@ -8,7 +10,7 @@ PLIST=~/Library/LaunchAgents/com.devin.usage-tray.plist
 if [ "$1" = "--uninstall" ]; then
     launchctl unload "$PLIST" 2>/dev/null || true
     rm -f "$PLIST"
-    crontab -l 2>/dev/null | grep -v devin_usage | crontab - || true
+    crontab -l 2>/dev/null | grep -v -e devin_usage -e devin-usage-tray | crontab - || true
     echo "uninstalled"; exit 0
 fi
 
@@ -34,6 +36,8 @@ else
     echo "tray exe not found, skipping (build: cd devin-usage-tray && cargo build --release)"
 fi
 
-(crontab -l 2>/dev/null | grep -v devin_usage; \
- echo "*/15 * * * * cd $DIR && /usr/bin/python3 devin_usage.py collect >> data/cron.log 2>&1") | crontab -
-echo "cron installed (every 15min)"
+if [ -x "$TRAY" ]; then
+(crontab -l 2>/dev/null | grep -v -e devin_usage -e devin-usage-tray; \
+ echo "*/15 * * * * $TRAY collect >> $DIR/data/cron.log 2>&1") | crontab -
+echo "cron installed (every 15min, rust binary)"
+fi
