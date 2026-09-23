@@ -124,29 +124,13 @@ fn load_charts(days: i64, app: &str, device: Option<&str>) -> Charts {
     let t0 = if days > 0 { now() - days * 86400 } else { 0 };
     // 各列分开 sum：整行相加遇 NULL 会整行变 NULL（老会话无 metrics）
     let sql = match app {
-        "devin" =>
-            "SELECT strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') day,
-                    strftime('%m-%d', created_at, 'unixepoch', 'localtime') md,
-                    sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
-             FROM local_sessions
-             WHERE created_at >= ?1
-               AND source NOT IN ('cursor','antigravity','zcode','grok','claude')
-               AND (?3 IS NULL OR device=?3)
-             GROUP BY 1 ORDER BY 1",
+        // devin/全部 都走 usage_events：消息级时间戳归日，
+        // 跨天会话不再把历史 token 全堆在创建日
         "all" =>
             "SELECT day, substr(day,6) md,
                     sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
-             FROM (
-               SELECT strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') day,
-                      tok_in, tok_out, tok_cache_read, tok_cache_write
-                 FROM local_sessions
-                 WHERE created_at >= ?1
-                   AND source NOT IN ('cursor','antigravity','zcode','grok','claude')
-                   AND (?3 IS NULL OR device=?3)
-               UNION ALL
-               SELECT day, tok_in, tok_out, tok_cache_read, tok_cache_write
-                 FROM usage_events WHERE ts >= ?1 AND (?3 IS NULL OR device=?3)
-             ) GROUP BY 1 ORDER BY 1",
+             FROM usage_events WHERE ts >= ?1 AND (?3 IS NULL OR device=?3)
+             GROUP BY day ORDER BY day",
         _ =>
             "SELECT day, substr(day,6) md,
                     sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
@@ -234,34 +218,19 @@ fn load_day_detail(
         return (0, rows);
     };
     let (sql, p2): (&str, Option<&str>) = match app {
-        "devin" =>
-            ("SELECT model, count(*) cnt, sum(n_user),
-                    sum(tok_in), sum(tok_out), sum(tok_cache_read)
-             FROM local_sessions
-             WHERE strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') = ?1
-               AND source NOT IN ('cursor','antigravity','zcode','grok','claude')
-               AND (?3 IS NULL OR device=?3)
-             GROUP BY model
-             ORDER BY ifnull(sum(tok_in),0)+ifnull(sum(tok_out),0)
-                      +ifnull(sum(tok_cache_read),0)+ifnull(sum(tok_cache_write),0) DESC",
-             None),
         "all" =>
-            ("SELECT model, count(*), sum(nm),
-                    sum(tok_in), sum(tok_out), sum(tok_cache_read) FROM (
-                SELECT 'devin·'||model model, n_user nm,
-                       tok_in, tok_out, tok_cache_read FROM local_sessions
-                 WHERE strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') = ?1
-                   AND source NOT IN ('cursor','antigravity','zcode','grok','claude')
-                   AND (?3 IS NULL OR device=?3)
-                UNION ALL
-                SELECT app||'·'||model, 0, tok_in, tok_out, tok_cache_read
-                  FROM usage_events WHERE day=?1 AND (?3 IS NULL OR device=?3)
-             ) GROUP BY model
+            ("SELECT model, count(distinct session_id), count(*),
+                    sum(tok_in), sum(tok_out), sum(tok_cache_read)
+              FROM (SELECT app||'·'||model model, session_id,
+                           tok_in, tok_out, tok_cache_read
+                      FROM usage_events
+                     WHERE day=?1 AND (?3 IS NULL OR device=?3))
+             GROUP BY model
              ORDER BY sum(ifnull(tok_in,0)+ifnull(tok_out,0)
                         +ifnull(tok_cache_read,0)) DESC",
              None),
         _ =>
-            ("SELECT model, count(*), 0,
+            ("SELECT model, count(distinct session_id), count(*),
                     sum(tok_in), sum(tok_out), sum(tok_cache_read)
              FROM usage_events WHERE day=?1 AND app=?2 AND (?3 IS NULL OR device=?3)
              GROUP BY model

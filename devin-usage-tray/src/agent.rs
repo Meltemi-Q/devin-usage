@@ -781,6 +781,67 @@ fn collect_local(c: &Connection) -> i64 {
             );
         }
     }
+    // 消息级事件：按消息时间归日。会话级 tok_* 全部堆在 created_at 那天，
+    // 跨天会话（一个 session 跑好几天）会把历史消耗都算到创建日，
+    // 导致"今天用量"严重低估——usage_events 按 node 时间戳记。
+    if let Ok(mut st) = src.prepare(
+        "SELECT m.session_id, m.node_id, m.created_at,
+                json_extract(m.chat_message,'$.metadata.generation_model'),
+                json_extract(m.chat_message,'$.metadata.metrics.input_tokens'),
+                json_extract(m.chat_message,'$.metadata.metrics.output_tokens'),
+                json_extract(m.chat_message,'$.metadata.metrics.cache_read_tokens'),
+                json_extract(m.chat_message,'$.metadata.metrics.cache_creation_tokens'),
+                json_extract(m.chat_message,'$.metadata.metrics.total_time_ms'),
+                s.model, s.metadata
+         FROM message_nodes m JOIN sessions s ON s.id = m.session_id
+         WHERE COALESCE(s.hidden,0)=0
+           AND json_extract(m.chat_message,'$.role')='assistant'
+           AND json_extract(m.chat_message,'$.metadata.metrics.input_tokens') IS NOT NULL",
+    ) {
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                    r.get::<_, Option<i64>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
+                    r.get::<_, Option<String>>(10)?,
+                ))
+            })
+            .map(|it| it.flatten().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let dev = device();
+        for (sid, nid, ts, gmodel, ti, to, tcr, tcw, gms, smodel, meta_s) in rows {
+            let Some(ts) = ts else { continue };
+            let meta: Value = meta_s
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(Value::Null);
+            let kind = if vget(&meta["client_meta"], "cognition.ai/requestingTabId").is_some() {
+                "app"
+            } else {
+                "cli"
+            };
+            let model = gmodel.or(smodel).unwrap_or_else(|| "?".into());
+            let emeta = json!({"gen_ms": gms});
+            let _ = c.execute(
+                "INSERT OR IGNORE INTO usage_events
+                 (app,event_key,ts,day,model,kind,session_id,
+                  tok_in,tok_out,tok_cache_read,tok_cache_write,cost_usd,meta,device)
+                 VALUES('devin',?,?,?,?,?,?,?,?,?,?,NULL,?,?)",
+                params![
+                    format!("devin:{sid}:{nid}"), ts, day_of(ts), model, kind, sid,
+                    ti, to, tcr, tcw, emeta.to_string(), dev
+                ],
+            );
+        }
+    }
     sync_prices(c);
     log_run(c, "local", "ok", &format!("{n} sessions"));
     n

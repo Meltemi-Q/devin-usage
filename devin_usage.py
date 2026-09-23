@@ -445,6 +445,39 @@ def collect_local(c):
                      tok_cache_write=?, gen_ms=? WHERE session_id=?""",
                   (_int(row[1]), _int(row[2]), _int(row[3]), _int(row[4]),
                    _int(row[5]), row[0]))
+    # 消息级事件：按消息时间归日（会话级 tok_* 全堆在创建日，
+    # 跨天会话会把历史消耗算到创建日 → usage_events 按 node 时间戳记）
+    for row in src.execute("""
+        SELECT m.session_id, m.node_id, m.created_at,
+               json_extract(m.chat_message,'$.metadata.generation_model'),
+               json_extract(m.chat_message,'$.metadata.metrics.input_tokens'),
+               json_extract(m.chat_message,'$.metadata.metrics.output_tokens'),
+               json_extract(m.chat_message,'$.metadata.metrics.cache_read_tokens'),
+               json_extract(m.chat_message,'$.metadata.metrics.cache_creation_tokens'),
+               json_extract(m.chat_message,'$.metadata.metrics.total_time_ms'),
+               s.model, s.metadata
+        FROM message_nodes m JOIN sessions s ON s.id = m.session_id
+        WHERE COALESCE(s.hidden,0)=0
+          AND json_extract(m.chat_message,'$.role')='assistant'
+          AND json_extract(m.chat_message,'$.metadata.metrics.input_tokens') IS NOT NULL""").fetchall():
+        sid, nid, ts, gmodel, ti, to, tcr, tcw, gms, smodel, meta_s = row
+        if not ts:
+            continue
+        try:
+            meta = json.loads(meta_s) if meta_s else {}
+        except Exception:
+            meta = {}
+        kind = "app" if (meta.get("client_meta") or {}).get("cognition.ai/requestingTabId") else "cli"
+        model = gmodel or smodel or "?"
+        c.execute("""INSERT OR IGNORE INTO usage_events
+                     (app,event_key,ts,day,model,kind,session_id,
+                      tok_in,tok_out,tok_cache_read,tok_cache_write,cost_usd,meta,device)
+                     VALUES('devin',?,?,?,?,?,?,?,?,?,?,NULL,?,?)""",
+                  (f"devin:{sid}:{nid}", ts,
+                   datetime.fromtimestamp(ts).strftime("%Y-%m-%d"),
+                   model, kind, sid,
+                   _int(ti), _int(to), _int(tcr), _int(tcw),
+                   json.dumps({"gen_ms": gms}), device()))
     src.close()
     sync_prices(c)
     log_run(c, "local", "ok", f"{n} sessions")
