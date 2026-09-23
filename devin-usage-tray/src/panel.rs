@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::TimeZone;
 use eframe::egui;
 use egui_plot::{Bar, BarChart, Legend, Plot};
 
@@ -171,6 +172,50 @@ fn load_charts(days: i64, app: &str, device: Option<&str>) -> Charts {
         };
         if let Some(rows) = rows {
             c.daily = rows.flatten().collect();
+        }
+    }
+    // 补齐缺数据的日期：GROUP BY 只返回有记录的日子，缺日被压缩掉会让
+    // 日期间隔失真（如 devin tab 14 天只有 5 根柱，09-19 与 09-23 看着相邻）。
+    // 用日历天补零，起点 = 选定区间起点，终点 = 今天。
+    if !c.daily.is_empty() {
+        let first = c.daily.first().unwrap().ymd.clone();
+        let last_real = c.daily.last().unwrap().ymd.clone();
+        let today = crate::now();
+        let today_ymd = chrono::Local
+            .timestamp_opt(today, 0)
+            .single()
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| last_real.clone());
+        let end = if today_ymd > last_real { today_ymd } else { last_real };
+        let start = if days > 0 {
+            let s = chrono::Local
+                .timestamp_opt(today - (days - 1) * 86400, 0)
+                .single()
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| first.clone());
+            if s < first { s } else { first }
+        } else {
+            first
+        };
+        let parse = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok();
+        if let (Some(mut d0), Some(d1)) = (parse(&start), parse(&end)) {
+            let mut filled = Vec::new();
+            let mut it = c.daily.into_iter().peekable();
+            while d0 <= d1 {
+                let ymd = d0.format("%Y-%m-%d").to_string();
+                if it.peek().map(|r| r.ymd == ymd).unwrap_or(false) {
+                    filled.push(it.next().unwrap());
+                } else {
+                    filled.push(DayRow {
+                        label: ymd[5..].to_string(),
+                        ymd,
+                        vals: [0.0; 4],
+                    });
+                }
+                d0 += chrono::Duration::days(1);
+            }
+            filled.extend(it);
+            c.daily = filled;
         }
     }
     c
@@ -481,16 +526,17 @@ impl Panel {
         s
     }
 
-    /// x 轴标签抽稀
+    /// x 轴标签抽稀；首尾必标（最右一定是今天，抽稀会把它吞掉导致误读）
     fn x_fmt(
         labels: &[String],
         max: usize,
     ) -> impl Fn(egui_plot::GridMark, &std::ops::RangeInclusive<f64>) -> String {
         let owned = labels.to_vec();
-        let step = (owned.len() / max).max(1);
+        let n = owned.len();
+        let step = (n / max).max(1);
         move |mark, _| {
             let i = mark.value.round() as usize;
-            if i % step == 0 {
+            if i % step == 0 || i + 1 == n {
                 owned.get(i).cloned().unwrap_or_default()
             } else {
                 String::new()
@@ -1298,20 +1344,35 @@ impl eframe::App for Panel {
                     ui.add_space(6.0);
                 }
 
-                // ---- Token 构成卡片（跟随当前 Tab + 时间区间）
+                // ---- Token 构成卡片（跟随选中日期 > 时间区间）
                 card(ui, |ui| {
-                    let mut rt = Agg::default();
-                    for d in &self.charts.daily {
-                        rt.tin += d.vals[0] as i64;
-                        rt.tout += d.vals[1] as i64;
-                        rt.tcr += d.vals[2] as i64;
-                        rt.tcw += d.vals[3] as i64;
-                    }
-                    let sum = rt.tin + rt.tout + rt.tcr + rt.tcw;
-                    let label = if self.days > 0 {
-                        format!("近{}天 {}", self.days, tok_zh(sum))
+                    let (rt, label) = if let Some(ymd) = &self.sel_day {
+                        // 点中某天 → 构成卡变成那天的
+                        let mut rt = Agg::default();
+                        if let Some(d) = self.charts.daily.iter().find(|d| &d.ymd == ymd)
+                        {
+                            rt.tin = d.vals[0] as i64;
+                            rt.tout = d.vals[1] as i64;
+                            rt.tcr = d.vals[2] as i64;
+                            rt.tcw = d.vals[3] as i64;
+                        }
+                        let sum = rt.tin + rt.tout + rt.tcr + rt.tcw;
+                        (rt, format!("{ymd} 当天 {}", tok_zh(sum)))
                     } else {
-                        format!("累计 {}", tok_zh(sum))
+                        let mut rt = Agg::default();
+                        for d in &self.charts.daily {
+                            rt.tin += d.vals[0] as i64;
+                            rt.tout += d.vals[1] as i64;
+                            rt.tcr += d.vals[2] as i64;
+                            rt.tcw += d.vals[3] as i64;
+                        }
+                        let sum = rt.tin + rt.tout + rt.tcr + rt.tcw;
+                        let label = if self.days > 0 {
+                            format!("近{}天 {}", self.days, tok_zh(sum))
+                        } else {
+                            format!("累计 {}", tok_zh(sum))
+                        };
+                        (rt, label)
                     };
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Token 构成").strong());
