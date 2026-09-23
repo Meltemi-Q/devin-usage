@@ -151,7 +151,7 @@ fn load_charts(days: i64, app: &str, device: Option<&str>) -> Charts {
             })
         };
         let rows = match app {
-            "devin" | "all" => s.query_map(rusqlite::params![t0, "x", device], parse).ok(),
+            "all" => s.query_map(rusqlite::params![t0, "x", device], parse).ok(),
             _ => s.query_map(rusqlite::params![t0, app, device], parse).ok(),
         };
         if let Some(rows) = rows {
