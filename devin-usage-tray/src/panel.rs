@@ -13,8 +13,8 @@ use eframe::egui;
 use egui_plot::{Bar, BarChart, Legend, Plot};
 
 use crate::{
-    build_report, load_stats, now, open_db, paint_icon, spawn_collect, tok, Agg, ModelRow,
-    Stats,
+    build_report, cost, load_prices, load_stats, now, open_db, paint_icon, price_of,
+    spawn_collect, tok, Agg, ModelRow, Stats,
 };
 
 const RELOAD: Duration = Duration::from_secs(60);
@@ -203,6 +203,88 @@ fn load_charts(days: i64, app: &str, device: Option<&str>) -> Charts {
         }
     }
     c
+}
+
+/// 模型明细（事件级）：跟随选中日期 > 天数区间 > 全部。
+/// devin 行用 kind(app/cli) 作来源标签，其他应用用 app 名；
+/// 时长取 meta.gen_ms（devin 有），无则 0。
+fn load_models(
+    app: &str,
+    device: Option<&str>,
+    ymd: Option<&str>,
+    days: i64,
+) -> Vec<ModelRow> {
+    let mut out = Vec::new();
+    let Some(conn) = open_db() else { return out };
+    let t0 = if ymd.is_none() && days > 0 { now() - days * 86400 } else { 0 };
+    let app_f = if app == "all" { None } else { Some(app) };
+    let rules = load_prices(&conn);
+    if let Ok(mut s) = conn.prepare(
+        "SELECT CASE WHEN app='devin' THEN COALESCE(kind,app) ELSE app END src,
+                model,
+                count(distinct COALESCE(session_id,'e'||rowid)),
+                count(*),
+                sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write),
+                sum(json_extract(meta,'$.gen_ms')),
+                sum(cost_usd)
+         FROM usage_events
+         WHERE (?1 IS NULL OR day=?1)
+           AND ts >= ?2
+           AND (?3 IS NULL OR device=?3)
+           AND (?4 IS NULL OR app=?4)
+         GROUP BY src, model
+         ORDER BY sum(ifnull(tok_in,0)+ifnull(tok_out,0)
+                    +ifnull(tok_cache_read,0)+ifnull(tok_cache_write,0)) DESC",
+    ) {
+        if let Ok(rows) = s.query_map(
+            rusqlite::params![ymd, t0, device, app_f],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+                    r.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                ))
+            },
+        ) {
+            for row in rows.flatten() {
+                let (src, model, n_sess, n_ev, ti, to, tcr, tcw, gms, rc) = row;
+                // antigravity 偶有多模型合并串 "?,gemini-3.8-flash" —— 取末段
+                let model = model
+                    .rsplit(',')
+                    .next()
+                    .unwrap_or(&model)
+                    .trim_start_matches('?')
+                    .to_string();
+                let a = Agg {
+                    sessions: n_sess,
+                    msgs: n_ev,
+                    tin: ti,
+                    tout: to,
+                    tcr,
+                    tcw,
+                    hours: gms as f64 / 3_600_000.0,
+                    ..Default::default()
+                };
+                let usd = if rc > 0.0 { rc } else { cost(&a, price_of(&model, &rules)) };
+                out.push(ModelRow {
+                    source: src,
+                    model,
+                    all: a,
+                    d7: Agg::default(),
+                    usd_all: usd,
+                    usd_7d: 0.0,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// 某一天的明细：该日记录数 + 分模型行（token 降序）。
@@ -1356,39 +1438,32 @@ impl eframe::App for Panel {
                 });
                 ui.add_space(6.0);
 
-                // ---- 模型族卡片（按当前应用）
+                // ---- 模型族卡片（跟随选中日期/区间；事件级口径）
                 card(ui, |ui| {
-                    let (models, note): (Vec<ModelRow>, &str) = match self.tab {
-                        "devin" => (
-                            self.st.all_models.clone(),
+                    let models = load_models(
+                        self.tab,
+                        self.device.as_deref(),
+                        self.sel_day.as_deref(),
+                        self.days,
+                    );
+                    let scope = self.sel_day.clone().unwrap_or_else(|| {
+                        if self.days > 0 {
+                            format!("近{}天", self.days)
+                        } else {
+                            "全部".into()
+                        }
+                    });
+                    let note = match self.tab {
+                        "devin" =>
                             "gpt-6-astra / gpt-5-6-* 等为 Devin 内部模型，无公开价，按 gpt 档折算",
-                        ),
-                        "all" => (
-                            self.st
-                                .all_models
-                                .iter()
-                                .cloned()
-                                .chain(self.st.apps.values().flat_map(|a| {
-                                    a.models.iter().cloned()
-                                }))
-                                .collect(),
+                        "all" =>
                             "全部应用合并视图；各应用计费/订阅独立，成本仅作量级参考",
-                        ),
-                        key => (
-                            self.st
-                                .apps
-                                .get(key)
-                                .map(|a| a.models.clone())
-                                .unwrap_or_default(),
-                            if key == "cursor" {
-                                "Cost=Included 为订阅内用量；估算按 API 刊例价折算"
-                            } else {
-                                "本地记录的 token 统计；按模型 API 价折算"
-                            },
-                        ),
+                        "cursor" =>
+                            "Cost=Included 为订阅内用量；估算按 API 刊例价折算",
+                        _ => "本地记录的 token 统计；按模型 API 价折算",
                     };
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("模型族（全部模型）").strong());
+                        ui.label(egui::RichText::new(format!("模型族（{scope}）")).strong());
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
