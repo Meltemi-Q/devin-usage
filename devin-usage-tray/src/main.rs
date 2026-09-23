@@ -1,32 +1,52 @@
 #![windows_subsystem = "windows"]
-//! devin-usage-tray — Windows 托盘图标，实时显示 Devin 用量
+//! devin-usage-tray — Devin/AI 工具用量：采集器 + 托盘图标 + 面板
 //!
-//! 只读 `data/usage.db`（由同目录 devin_usage.py collect 产出），不写任何 Devin 文件。
-//! 菜单每 60s 重建刷新；"立即采集"调用 python devin_usage.py collect。
+//! 子命令（无 GUI 依赖，可 headless 跑）：
+//!   collect [--only <name>]  采集一轮（quota/cloud/local/cursor/antigravity/zcode/grok/claude）
+//!   export [--for <dev>]     NDJSON 增量导出 → stdout
+//!   import                   stdin NDJSON → 入库
+//!   sync                     与 kv sync.peer 配置的 ssh 对端双向同步
+//! GUI（feature=gui 默认开）：无参数=托盘；--panel=面板。
 
 use std::path::PathBuf;
+#[cfg(feature = "gui")]
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "gui")]
+use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags};
+#[cfg(feature = "gui")]
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+#[cfg(feature = "gui")]
 use tray_icon::{Icon, TrayIconBuilder};
+#[cfg(feature = "gui")]
 use winit::application::ApplicationHandler;
+#[cfg(feature = "gui")]
 use winit::event::WindowEvent;
+#[cfg(feature = "gui")]
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+#[cfg(feature = "gui")]
 use winit::window::WindowId;
 
+mod agent;
+#[cfg(feature = "gui")]
 mod panel;
 
+#[cfg(feature = "gui")]
 const REFRESH: Duration = Duration::from_secs(60);
+#[cfg(feature = "gui")]
 const COLLECT_REFRESH_DELAY: Duration = Duration::from_secs(8);
 /// 托盘自身定时采集：进程活着就会每 15min 采一轮（不依赖任务计划/cron，
 /// 笔记本睡醒后下个周期自然恢复）；首次在启动 20s 后
+#[cfg(feature = "gui")]
 const COLLECT_INTERVAL: Duration = Duration::from_secs(15 * 60);
+#[cfg(feature = "gui")]
 const FIRST_COLLECT_DELAY: Duration = Duration::from_secs(20);
 
-// ---------------------------------------------------------------- 数据
+// ---------------------------------------------------------------- 数据（GUI）
 
+#[cfg(feature = "gui")]
 #[derive(Default)]
 pub struct Stats {
     pub quota: Option<Quota>,
@@ -46,8 +66,11 @@ pub struct Stats {
     pub all_models: Vec<ModelRow>,
     /// 其他应用独立统计（套餐各自独立，不混入 devin 数字）
     pub apps: std::collections::BTreeMap<String, AppStats>,
+    /// 库内出现过的设备标签（同步汇总后多设备）
+    pub devices: Vec<String>,
 }
 
+#[cfg(feature = "gui")]
 #[derive(Default)]
 pub struct AppStats {
     pub total_7d: Agg,
@@ -66,6 +89,7 @@ pub struct AppStats {
     pub quota_rows: Vec<(String, f64, Option<i64>, Option<f64>, Option<f64>)>,
 }
 
+#[cfg(feature = "gui")]
 pub struct Quota {
     pub plan: String,
     pub weekly_pct: f64,
@@ -74,6 +98,7 @@ pub struct Quota {
     pub weekly_reset: i64,
 }
 
+#[cfg(feature = "gui")]
 #[derive(Default, Clone)]
 pub struct Agg {
     pub sessions: i64,
@@ -86,6 +111,7 @@ pub struct Agg {
     pub tcw: i64,   // cache-write tokens
 }
 
+#[cfg(feature = "gui")]
 #[derive(Clone)]
 pub struct ModelRow {
     pub source: String,
@@ -99,8 +125,10 @@ pub struct ModelRow {
 /// 每 1M token 美元价格规则（prefix 首个命中；"" 兜底）——与 devin_usage.py 同源，
 /// 主数据在 db 的 model_prices 表（collect 时写入，含 data/prices.json 覆盖）
 #[derive(Clone)]
+#[cfg(feature = "gui")]
 pub struct PriceRule(f64, f64, f64, f64);
 
+#[cfg(feature = "gui")]
 pub fn load_prices(conn: &Connection) -> Vec<(String, PriceRule)> {
     let mut v = Vec::new();
     if let Ok(mut s) = conn.prepare(
@@ -126,6 +154,7 @@ pub fn load_prices(conn: &Connection) -> Vec<(String, PriceRule)> {
     v
 }
 
+#[cfg(feature = "gui")]
 pub fn price_of<'a>(model: &str, rules: &'a [(String, PriceRule)]) -> &'a PriceRule {
     let m = model.to_lowercase();
     rules
@@ -136,6 +165,7 @@ pub fn price_of<'a>(model: &str, rules: &'a [(String, PriceRule)]) -> &'a PriceR
         .unwrap()
 }
 
+#[cfg(feature = "gui")]
 pub fn cost(a: &Agg, p: &PriceRule) -> f64 {
     (a.tin as f64 * p.0 + a.tout as f64 * p.1 + a.tcr as f64 * p.2
         + a.tcw as f64 * p.3)
@@ -149,11 +179,11 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
-/// 从 exe 向上找含 devin_usage.py 的目录（exe 在 devin-usage-tray/target/{profile}/ 下）
+/// 从 exe 向上找项目根目录（exe 在 devin-usage-tray/target/{profile}/ 下）
 pub fn project_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     for anc in exe.ancestors().skip(1).take(6) {
-        if anc.join("devin_usage.py").is_file() {
+        if anc.join("data").is_dir() || anc.join("devin_usage.py").is_file() {
             return Some(anc.to_path_buf());
         }
     }
@@ -173,6 +203,7 @@ pub fn open_db() -> Option<Connection> {
     .ok()
 }
 
+#[cfg(feature = "gui")]
 pub fn agg(r: &rusqlite::Row, base: usize) -> rusqlite::Result<Agg> {
     Ok(Agg {
         sessions: r.get::<_, Option<i64>>(base)?.unwrap_or(0),
@@ -187,6 +218,7 @@ pub fn agg(r: &rusqlite::Row, base: usize) -> rusqlite::Result<Agg> {
 }
 
 /// token 人性化: 1234→1.2k 4500000→4.5M
+#[cfg(feature = "gui")]
 pub fn tok(v: i64) -> String {
     let v = v as f64;
     for (u, d) in [("B", 1e9), ("M", 1e6), ("k", 1e3)] {
@@ -197,7 +229,8 @@ pub fn tok(v: i64) -> String {
     format!("{}", v as i64)
 }
 
-pub fn load_stats() -> Stats {
+#[cfg(feature = "gui")]
+pub fn load_stats(device: Option<&str>) -> Stats {
     let mut st = Stats {
         last_collect_ago: "从未".into(),
         ..Stats::default()
@@ -209,12 +242,25 @@ pub fn load_stats() -> Stats {
     let n = now();
     let t7 = n - 7 * 86400;
 
+    // 设备清单（同步过的库会带多个）
+    if let Ok(mut s) = conn.prepare(
+        "SELECT DISTINCT device FROM (
+           SELECT device FROM usage_events UNION SELECT device FROM local_sessions
+           UNION SELECT device FROM app_quota UNION SELECT device FROM cloud_sessions
+         ) WHERE device IS NOT NULL AND device != '' ORDER BY 1",
+    ) {
+        if let Ok(rows) = s.query_map([], |r| r.get::<_, String>(0)) {
+            st.devices = rows.flatten().collect();
+        }
+    }
+
     st.quota = conn
         .query_row(
             "SELECT plan_name, weekly_quota_remaining_pct, overage_balance_micros,
                     daily_reset, weekly_reset
-             FROM quota_snapshots ORDER BY ts DESC LIMIT 1",
-            [],
+             FROM quota_snapshots WHERE (?1 IS NULL OR device=?1)
+             ORDER BY ts DESC LIMIT 1",
+            [device],
             |r| {
                 Ok(Quota {
                     plan: r.get::<_, Option<String>>(0)?.unwrap_or_else(|| "?".into()),
@@ -250,28 +296,35 @@ pub fn load_stats() -> Stats {
                        FROM local_sessions";
 
     st.swe2_all = conn
-        .query_row(&format!("{SEL} WHERE model LIKE 'swe-2%'"), [], |r| {
-            agg(r, 0)
-        })
-        .unwrap_or_default();
-    st.swe2_7d = conn
         .query_row(
-            &format!("{SEL} WHERE model LIKE 'swe-2%' AND created_at>=?1"),
-            [t7],
+            &format!("{SEL} WHERE model LIKE 'swe-2%' AND (?1 IS NULL OR device=?1)"),
+            [device],
             |r| agg(r, 0),
         )
         .unwrap_or_default();
-    // devin 系总计（排除 cursor/antigravity——各应用套餐独立，不混计）
-    const DEVIN_SRC: &str = "source NOT IN ('cursor','antigravity','zcode','grok')";
+    st.swe2_7d = conn
+        .query_row(
+            &format!("{SEL} WHERE model LIKE 'swe-2%' AND created_at>=?1 AND (?2 IS NULL OR device=?2)"),
+            rusqlite::params![t7, device],
+            |r| agg(r, 0),
+        )
+        .unwrap_or_default();
+    // devin 系总计（排除其他应用——各应用套餐独立，不混计）
+    const DEVIN_SRC: &str =
+        "source NOT IN ('cursor','antigravity','zcode','grok','claude')";
     st.total_7d = conn
         .query_row(
-            &format!("{SEL} WHERE {DEVIN_SRC} AND created_at>=?1"),
-            [t7],
+            &format!("{SEL} WHERE {DEVIN_SRC} AND created_at>=?1 AND (?2 IS NULL OR device=?2)"),
+            rusqlite::params![t7, device],
             |r| agg(r, 0),
         )
         .unwrap_or_default();
     st.total_all = conn
-        .query_row(&format!("{SEL} WHERE {DEVIN_SRC}"), [], |r| agg(r, 0))
+        .query_row(
+            &format!("{SEL} WHERE {DEVIN_SRC} AND (?1 IS NULL OR device=?1)"),
+            [device],
+            |r| agg(r, 0),
+        )
         .unwrap_or_default();
 
     // 等效成本：db 里的 model_prices 规则表（首个 prefix 命中）
@@ -279,12 +332,28 @@ pub fn load_stats() -> Stats {
     st.swe2_usd_7d = cost(&st.swe2_7d, price_of("swe-2", &rules));
     st.swe2_usd_all = cost(&st.swe2_all, price_of("swe-2", &rules));
     // 全模型成本：逐模型行按各自价格累计（仅 devin 系）
-    for (sql, args, dst) in [
-        (format!("{SELM} WHERE {DEVIN_SRC} GROUP BY model"), vec![], &mut st.usd_all),
-        (format!("{SELM} WHERE {DEVIN_SRC} AND created_at>=?1 GROUP BY model"), vec![t7], &mut st.usd_7d),
+    for (sql, dst) in [
+        (
+            format!("{SELM} WHERE {DEVIN_SRC} AND (?1 IS NULL OR device=?1) GROUP BY model"),
+            &mut st.usd_all,
+        ),
+        (
+            format!("{SELM} WHERE {DEVIN_SRC} AND created_at>=?1 AND (?2 IS NULL OR device=?2) GROUP BY model"),
+            &mut st.usd_7d,
+        ),
     ] {
+        let args: Vec<i64> = if sql.contains("created_at>=?1") { vec![t7] } else { vec![] };
         if let Ok(mut s) = conn.prepare(&sql) {
-            if let Ok(rows) = s.query_map(rusqlite::params_from_iter(args), |r| {
+            let params: Vec<rusqlite::types::Value> = args
+                .iter()
+                .map(|a| rusqlite::types::Value::Integer(*a))
+                .chain(std::iter::once(
+                    device
+                        .map(|d| rusqlite::types::Value::Text(d.to_string()))
+                        .unwrap_or(rusqlite::types::Value::Null),
+                ))
+                .collect();
+            if let Ok(rows) = s.query_map(rusqlite::params_from_iter(params), |r| {
                 Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), agg(r, 1)?))
             }) {
                 for (mdl, a) in rows.flatten() {
@@ -299,9 +368,9 @@ pub fn load_stats() -> Stats {
                         sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
                         FROM local_sessions";
     if let Ok(mut stmt) = conn.prepare(&format!(
-        "{SELM} WHERE model LIKE 'swe-2%' GROUP BY model ORDER BY 2 DESC"
+        "{SELM} WHERE model LIKE 'swe-2%' AND (?1 IS NULL OR device=?1) GROUP BY model ORDER BY 2 DESC"
     )) {
-        if let Ok(rows) = stmt.query_map([], |r| {
+        if let Ok(rows) = stmt.query_map([device], |r| {
             Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), agg(r, 1)?))
         }) {
             for row in rows.flatten().take(6) {
@@ -318,9 +387,9 @@ pub fn load_stats() -> Stats {
         }
     }
     if let Ok(mut stmt) = conn.prepare(&format!(
-        "{SELM} WHERE model LIKE 'swe-2%' AND created_at>=?1 GROUP BY model"
+        "{SELM} WHERE model LIKE 'swe-2%' AND created_at>=?1 AND (?2 IS NULL OR device=?2) GROUP BY model"
     )) {
-        if let Ok(rows) = stmt.query_map([t7], |r| {
+        if let Ok(rows) = stmt.query_map(rusqlite::params![t7, device], |r| {
             Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), agg(r, 1)?))
         }) {
             for (model, a) in rows.flatten() {
@@ -338,11 +407,12 @@ pub fn load_stats() -> Stats {
                         sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
                         FROM local_sessions";
     if let Ok(mut stmt) = conn.prepare(&format!(
-        "{SELSM} WHERE source NOT IN ('cursor','antigravity','zcode','grok') GROUP BY source, model
+        "{SELSM} WHERE source NOT IN ('cursor','antigravity','zcode','grok','claude')
+           AND (?1 IS NULL OR device=?1) GROUP BY source, model
          ORDER BY sum(ifnull(tok_in,0)+ifnull(tok_out,0)+ifnull(tok_cache_read,0)+ifnull(tok_cache_write,0)) DESC
          LIMIT 200"
     )) {
-        if let Ok(rows) = stmt.query_map([], |r| {
+        if let Ok(rows) = stmt.query_map([device], |r| {
             Ok((
                 r.get::<_, Option<String>>(0)?.unwrap_or_default(),
                 r.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -362,13 +432,13 @@ pub fn load_stats() -> Stats {
         }
     }
     // 其他应用：独立统计（各应用套餐独立，绝不混入 devin 数字）
-    for app in ["cursor", "antigravity", "zcode", "grok"] {
-        st.apps.insert(app.to_string(), load_app_stats(&conn, app, t7, &rules));
+    for app in ["cursor", "antigravity", "zcode", "grok", "claude"] {
+        st.apps.insert(app.to_string(), load_app_stats(&conn, app, t7, &rules, device));
     }
     if let Ok(mut stmt) =
-        conn.prepare(&format!("{SELSM} WHERE source NOT IN ('cursor','antigravity','zcode','grok') AND created_at>=?1 GROUP BY source, model"))
+        conn.prepare(&format!("{SELSM} WHERE source NOT IN ('cursor','antigravity','zcode','grok','claude') AND created_at>=?1 AND (?2 IS NULL OR device=?2) GROUP BY source, model"))
     {
-        if let Ok(rows) = stmt.query_map([t7], |r| {
+        if let Ok(rows) = stmt.query_map(rusqlite::params![t7, device], |r| {
             Ok((
                 r.get::<_, Option<String>>(0)?.unwrap_or_default(),
                 r.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -392,24 +462,26 @@ pub fn load_stats() -> Stats {
 
 /// 其他应用（cursor/antigravity）独立统计：
 /// token 账本=usage_events（真实口径），会话数=local_sessions(source=app)
+#[cfg(feature = "gui")]
 fn load_app_stats(
     conn: &Connection,
     app: &str,
     t7: i64,
     rules: &[(String, PriceRule)],
+    device: Option<&str>,
 ) -> AppStats {
     let mut a = AppStats::default();
     a.sessions_all = conn
         .query_row(
-            "SELECT count(*) FROM local_sessions WHERE source=?1",
-            [app],
+            "SELECT count(*) FROM local_sessions WHERE source=?1 AND (?2 IS NULL OR device=?2)",
+            rusqlite::params![app, device],
             |r| r.get(0),
         )
         .unwrap_or(0);
     a.sessions_7d = conn
         .query_row(
-            "SELECT count(*) FROM local_sessions WHERE source=?1 AND created_at>=?2",
-            rusqlite::params![app, t7],
+            "SELECT count(*) FROM local_sessions WHERE source=?1 AND created_at>=?2 AND (?3 IS NULL OR device=?3)",
+            rusqlite::params![app, t7, device],
             |r| r.get(0),
         )
         .unwrap_or(0);
@@ -417,8 +489,8 @@ fn load_app_stats(
         let row = conn.query_row(
             "SELECT count(*), sum(tok_in), sum(tok_out), sum(tok_cache_read),
                     sum(tok_cache_write), sum(cost_usd)
-             FROM usage_events WHERE app=?1 AND ts>=?2",
-            rusqlite::params![app, since],
+             FROM usage_events WHERE app=?1 AND ts>=?2 AND (?3 IS NULL OR device=?3)",
+            rusqlite::params![app, since, device],
             |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -449,10 +521,10 @@ fn load_app_stats(
         if let Ok(mut s) = conn.prepare(
             "SELECT model, count(*), sum(tok_in), sum(tok_out), sum(tok_cache_read),
                     sum(tok_cache_write), sum(cost_usd)
-             FROM usage_events WHERE app=?1 AND ts>=?2 GROUP BY model
-             ORDER BY 3 DESC",
+             FROM usage_events WHERE app=?1 AND ts>=?2 AND (?3 IS NULL OR device=?3)
+             GROUP BY model ORDER BY 3 DESC",
         ) {
-            if let Ok(rows) = s.query_map(rusqlite::params![app, since], |r| {
+            if let Ok(rows) = s.query_map(rusqlite::params![app, since, device], |r| {
                 let mut ag = Agg::default();
                 ag.sessions = r.get::<_, Option<i64>>(1)?.unwrap_or(0);
                 ag.tin = r.get::<_, Option<i64>>(2)?.unwrap_or(0);
@@ -528,28 +600,46 @@ fn load_app_stats(
     } else {
         a.models.iter().map(|m| m.usd_7d).sum()
     };
-    // 配额快照：每 label 取最新一条
+    // 配额快照：取每设备最新一批（多设备汇总时 label 带 @设备 后缀）
     if let Ok(mut s) = conn.prepare(
-        "SELECT label, pct_remaining, resets_at, used, lim FROM app_quota
-         WHERE app=?1 AND ts=(SELECT max(ts) FROM app_quota WHERE app=?1)
-         ORDER BY CASE label WHEN 'plan' THEN 0 WHEN '_plan' THEN 1
-                             WHEN 'auto' THEN 2 WHEN 'api' THEN 3
-                             ELSE 9 END, label",
+        "SELECT q.label, q.pct_remaining, q.resets_at, q.used, q.lim, q.device
+         FROM app_quota q
+         WHERE q.app=?1 AND (?2 IS NULL OR q.device=?2)
+           AND q.ts = (SELECT max(ts) FROM app_quota
+                       WHERE app=?1 AND device=q.device)
+         ORDER BY CASE q.label WHEN 'plan' THEN 0 WHEN '_plan' THEN 1
+                               WHEN 'auto' THEN 2 WHEN 'api' THEN 3
+                               ELSE 9 END, q.device, q.label",
     ) {
-        if let Ok(rows) = s.query_map([app], |r| {
+        if let Ok(rows) = s.query_map(rusqlite::params![app, device], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
                 r.get::<_, Option<i64>>(2)?,
                 r.get::<_, Option<f64>>(3)?,
                 r.get::<_, Option<f64>>(4)?,
+                r.get::<_, String>(5)?,
             ))
         }) {
             // 归并：antigravity 同模型的推理档位 "(High|Low|Medium|Thinking)"
             // 共享配额，按基名合并——取最紧剩余% + 最早重置时间
+            let rows: Vec<(String, f64, Option<i64>, Option<f64>, Option<f64>, String)> =
+                rows.flatten().collect();
+            let multi_dev = device.is_none()
+                && rows
+                    .iter()
+                    .map(|r| r.5.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    > 1;
             let mut grouped: Vec<(String, f64, Option<i64>, Option<f64>, Option<f64>)> =
                 Vec::new();
-            for (label, pct, resets, used, lim) in rows.flatten() {
+            for (label, pct, resets, used, lim, dev) in rows {
+                let label = if multi_dev {
+                    format!("{label}@{dev}")
+                } else {
+                    label
+                };
                 let base = if label.ends_with(')') {
                     label
                         .rfind('(')
@@ -617,12 +707,14 @@ fn load_app_stats(
     a
 }
 
-// ---------------------------------------------------------------- 图标
+// ---------------------------------------------------------------- 图标（GUI）
 
+#[cfg(feature = "gui")]
 const LOGO_PNG: &[u8] = include_bytes!("../assets/devin-logo-1024.png");
 
 /// 托盘图标像素（size×size，Retina 建议 64）：白底圆角卡片 + Devin 黑色标志
 /// + 右下配额状态点装饰。quota_pct: 周配额剩余 %（None→灰点）
+#[cfg(feature = "gui")]
 pub fn paint_icon(quota_pct: Option<f64>, size: usize) -> Vec<u8> {
     let (w, h) = (size, size);
     let s = size as f32 / 32.0; // 相对 32px 设计稿的缩放
@@ -693,13 +785,15 @@ pub fn paint_icon(quota_pct: Option<f64>, size: usize) -> Vec<u8> {
     px
 }
 
+#[cfg(feature = "gui")]
 pub fn make_icon(quota_pct: Option<f64>) -> Icon {
     let px = paint_icon(quota_pct, 64); // 64px：Retina @2x 清晰
     Icon::from_rgba(px, 64, 64).expect("icon")
 }
 
-// ---------------------------------------------------------------- UI
+// ---------------------------------------------------------------- UI（GUI）
 
+#[cfg(feature = "gui")]
 struct App {
     tray: tray_icon::TrayIcon,
     id_collect: MenuId,
@@ -712,6 +806,7 @@ struct App {
     last_report: String,
 }
 
+#[cfg(feature = "gui")]
 impl App {
     fn new() -> Self {
         let menu = Menu::new();
@@ -743,7 +838,7 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        let st = load_stats();
+        let st = load_stats(Some(&agent::device())); // 托盘只看本机
         let menu = Menu::new();
         let add = |m: &Menu, text: String| {
             menu.append(&MenuItem::new(text, false, None)).ok();
@@ -850,32 +945,23 @@ impl App {
     }
 }
 
-/// 后台起 python devin_usage.py collect（托盘与面板共用）
+/// 后台起自身二进制的 collect 子命令（托盘与面板共用）
+#[cfg(feature = "gui")]
 pub fn spawn_collect() -> bool {
-    let Some(dir) = project_dir() else { return false };
-    let script = dir.join("devin_usage.py");
-    #[cfg(target_os = "macos")]
-    let pys = ["python3", "/usr/bin/python3"];
-    #[cfg(not(target_os = "macos"))]
-    let pys = [
-        "python",
-        "py",
-        r"C:\Users\meltemi\scoop\apps\miniconda3\current\python.exe",
-    ];
-    pys.iter().any(|py| {
-        let mut c = Command::new(py);
-        c.arg(&script).arg("collect").current_dir(&dir);
-        #[cfg(target_os = "windows")]
-        {
-            // CREATE_NO_WINDOW：采集不弹控制台窗口
-            use std::os::windows::process::CommandExt;
-            c.creation_flags(0x08000000);
-        }
-        c.spawn().is_ok()
-    })
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let mut c = Command::new(exe);
+    c.arg("collect");
+    #[cfg(target_os = "windows")]
+    {
+        // CREATE_NO_WINDOW：采集不弹控制台窗口
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x08000000);
+    }
+    c.spawn().is_ok()
 }
 
 /// 文本报告（托盘"复制报告"与面板共用）
+#[cfg(feature = "gui")]
 pub fn build_report(st: &Stats) -> String {
     let mut r = String::new();
     if let Some(q) = &st.quota {
@@ -914,6 +1000,7 @@ pub fn build_report(st: &Stats) -> String {
     r
 }
 
+#[cfg(feature = "gui")]
 impl ApplicationHandler for App {
     fn resumed(&mut self, _el: &ActiveEventLoop) {}
     fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, _e: WindowEvent) {}
@@ -960,34 +1047,71 @@ impl ApplicationHandler for App {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--dump-icon") {
-        for (name, pct) in [("icon-green", Some(75.0)), ("icon-amber", Some(30.0)),
-                            ("icon-red", Some(5.0)), ("icon-gray", None)] {
-            let px = paint_icon(pct, 64);
-            image::save_buffer(
-                format!("{name}.png"), &px, 64, 64, image::ColorType::Rgba8,
-            )
-            .unwrap();
+    // 采集器/同步子命令——不依赖 GUI，VPS 可 --no-default-features 编译后直接用
+    match args.get(1).map(|s| s.as_str()) {
+        Some("collect") => {
+            let only = args
+                .windows(2)
+                .find(|w| w[0] == "--only")
+                .map(|w| w[1].as_str());
+            agent::collect_cli(only);
+            return;
         }
-        println!("icons dumped");
-        return;
-    }
-    if args.iter().any(|a| a == "--panel") {
-        if let Err(e) = panel::run() {
-            eprintln!("panel: {e}");
-            std::process::exit(1);
+        Some("export") => {
+            let for_dev = args
+                .windows(2)
+                .find(|w| w[0] == "--for")
+                .map(|w| w[1].as_str());
+            agent::export_cli(for_dev);
+            return;
         }
-        return;
+        Some("import") => {
+            agent::import_cli();
+            return;
+        }
+        Some("sync") => {
+            agent::sync_cli();
+            return;
+        }
+        _ => {}
     }
-    #[allow(unused_mut)]
-    let mut builder = EventLoop::builder();
-    #[cfg(target_os = "macos")]
+
+    #[cfg(feature = "gui")]
     {
-        // 纯托盘：不占 Dock 位（菜单栏拥挤时面板走 .app 启动）
-        use winit::platform::macos::EventLoopBuilderExtMacOS;
-        builder.with_activation_policy(winit::platform::macos::ActivationPolicy::Accessory);
+        if args.iter().any(|a| a == "--dump-icon") {
+            for (name, pct) in [("icon-green", Some(75.0)), ("icon-amber", Some(30.0)),
+                                ("icon-red", Some(5.0)), ("icon-gray", None)] {
+                let px = paint_icon(pct, 64);
+                image::save_buffer(
+                    format!("{name}.png"), &px, 64, 64, image::ColorType::Rgba8,
+                )
+                .unwrap();
+            }
+            println!("icons dumped");
+            return;
+        }
+        if args.iter().any(|a| a == "--panel") {
+            if let Err(e) = panel::run() {
+                eprintln!("panel: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[allow(unused_mut)]
+        let mut builder = EventLoop::builder();
+        #[cfg(target_os = "macos")]
+        {
+            // 纯托盘：不占 Dock 位（菜单栏拥挤时面板走 .app 启动）
+            use winit::platform::macos::EventLoopBuilderExtMacOS;
+            builder.with_activation_policy(winit::platform::macos::ActivationPolicy::Accessory);
+        }
+        let el = builder.build().expect("event loop");
+        let mut app = App::new();
+        el.run_app(&mut app).expect("run");
     }
-    let el = builder.build().expect("event loop");
-    let mut app = App::new();
-    el.run_app(&mut app).expect("run");
+
+    #[cfg(not(feature = "gui"))]
+    {
+        eprintln!("devin-usage-agent：collect [--only <n>] | export [--for <dev>] | import | sync");
+    }
 }

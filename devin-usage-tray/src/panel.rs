@@ -30,7 +30,7 @@ const C_CW: egui::Color32 = egui::Color32::from_rgb(114, 98, 253);
 
 pub fn run() -> eframe::Result<()> {
     // 先读一次数据：窗口图标要用真实配额决定状态点颜色（与托盘一致）
-    let st0 = load_stats();
+    let st0 = load_stats(None);
     let pct = st0.quota.as_ref().map(|q| q.weekly_pct);
     let px = paint_icon(pct, 64);
     let opts = eframe::NativeOptions {
@@ -115,8 +115,9 @@ struct Charts {
     daily: Vec<DayRow>,
 }
 
-/// days=0 → 全部历史；app="devin" 走 local_sessions，其他应用走 usage_events
-fn load_charts(days: i64, app: &str) -> Charts {
+/// days=0 → 全部历史；app="devin" 走 local_sessions，其他应用走 usage_events；
+/// device=Some → 只看该设备
+fn load_charts(days: i64, app: &str, device: Option<&str>) -> Charts {
     let mut c = Charts::default();
     let Some(conn) = open_db() else { return c };
     let t0 = if days > 0 { now() - days * 86400 } else { 0 };
@@ -128,7 +129,8 @@ fn load_charts(days: i64, app: &str) -> Charts {
                     sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
              FROM local_sessions
              WHERE created_at >= ?1
-               AND source NOT IN ('cursor','antigravity','zcode','grok')
+               AND source NOT IN ('cursor','antigravity','zcode','grok','claude')
+               AND (?3 IS NULL OR device=?3)
              GROUP BY 1 ORDER BY 1",
         "all" =>
             "SELECT day, substr(day,6) md,
@@ -138,15 +140,16 @@ fn load_charts(days: i64, app: &str) -> Charts {
                       tok_in, tok_out, tok_cache_read, tok_cache_write
                  FROM local_sessions
                  WHERE created_at >= ?1
-                   AND source NOT IN ('cursor','antigravity','zcode','grok')
+                   AND source NOT IN ('cursor','antigravity','zcode','grok','claude')
+                   AND (?3 IS NULL OR device=?3)
                UNION ALL
                SELECT day, tok_in, tok_out, tok_cache_read, tok_cache_write
-                 FROM usage_events WHERE ts >= ?1
+                 FROM usage_events WHERE ts >= ?1 AND (?3 IS NULL OR device=?3)
              ) GROUP BY 1 ORDER BY 1",
         _ =>
             "SELECT day, substr(day,6) md,
                     sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
-             FROM usage_events WHERE ts >= ?1 AND app = ?2
+             FROM usage_events WHERE ts >= ?1 AND app = ?2 AND (?3 IS NULL OR device=?3)
              GROUP BY day ORDER BY day",
     };
     if let Ok(mut s) = conn.prepare(sql) {
@@ -163,8 +166,8 @@ fn load_charts(days: i64, app: &str) -> Charts {
             })
         };
         let rows = match app {
-            "devin" | "all" => s.query_map(rusqlite::params![t0], parse).ok(),
-            _ => s.query_map(rusqlite::params![t0, app], parse).ok(),
+            "devin" | "all" => s.query_map(rusqlite::params![t0, "x", device], parse).ok(),
+            _ => s.query_map(rusqlite::params![t0, app, device], parse).ok(),
         };
         if let Some(rows) = rows {
             c.daily = rows.flatten().collect();
@@ -178,6 +181,7 @@ fn load_charts(days: i64, app: &str) -> Charts {
 fn load_day_detail(
     ymd: &str,
     app: &str,
+    device: Option<&str>,
 ) -> (i64, Vec<(String, i64, i64, i64, i64, i64)>) {
     let mut n_sess = 0i64;
     let mut rows = Vec::new();
@@ -190,7 +194,8 @@ fn load_day_detail(
                     sum(tok_in), sum(tok_out), sum(tok_cache_read)
              FROM local_sessions
              WHERE strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') = ?1
-               AND source NOT IN ('cursor','antigravity','zcode','grok')
+               AND source NOT IN ('cursor','antigravity','zcode','grok','claude')
+               AND (?3 IS NULL OR device=?3)
              GROUP BY model
              ORDER BY ifnull(sum(tok_in),0)+ifnull(sum(tok_out),0)
                       +ifnull(sum(tok_cache_read),0)+ifnull(sum(tok_cache_write),0) DESC",
@@ -201,10 +206,11 @@ fn load_day_detail(
                 SELECT 'devin·'||model model, n_user nm,
                        tok_in, tok_out, tok_cache_read FROM local_sessions
                  WHERE strftime('%Y-%m-%d', created_at, 'unixepoch', 'localtime') = ?1
-                   AND source NOT IN ('cursor','antigravity','zcode','grok')
+                   AND source NOT IN ('cursor','antigravity','zcode','grok','claude')
+                   AND (?3 IS NULL OR device=?3)
                 UNION ALL
                 SELECT app||'·'||model, 0, tok_in, tok_out, tok_cache_read
-                  FROM usage_events WHERE day=?1
+                  FROM usage_events WHERE day=?1 AND (?3 IS NULL OR device=?3)
              ) GROUP BY model
              ORDER BY sum(ifnull(tok_in,0)+ifnull(tok_out,0)
                         +ifnull(tok_cache_read,0)) DESC",
@@ -212,7 +218,8 @@ fn load_day_detail(
         _ =>
             ("SELECT model, count(*), 0,
                     sum(tok_in), sum(tok_out), sum(tok_cache_read)
-             FROM usage_events WHERE day=?1 AND app=?2 GROUP BY model
+             FROM usage_events WHERE day=?1 AND app=?2 AND (?3 IS NULL OR device=?3)
+             GROUP BY model
              ORDER BY sum(tok_in)+sum(tok_out)+sum(tok_cache_read) DESC",
              Some(app)),
     };
@@ -228,9 +235,9 @@ fn load_day_detail(
             ))
         };
         let it = if let Some(a) = p2 {
-            s.query_map(rusqlite::params![ymd, a], parse).ok()
+            s.query_map(rusqlite::params![ymd, a, device], parse).ok()
         } else {
-            s.query_map([ymd], parse).ok()
+            s.query_map(rusqlite::params![ymd, "x", device], parse).ok()
         };
         if let Some(it) = it {
             for row in it.flatten() {
@@ -271,7 +278,8 @@ struct Panel {
     st: Stats,
     charts: Charts,
     days: i64, // 图表回看范围：7/14/30/90，0=全部
-    tab: &'static str, // "devin" | "cursor" | "antigravity" —— 各应用套餐独立
+    tab: &'static str, // "devin" | "cursor" | ... 各应用套餐独立
+    device: Option<String>, // 设备过滤：None=全部设备
     report: String,
     logo: Option<egui::TextureHandle>,
     sel_day: Option<String>, // 图表中选中的日期（点柱子/下拉）
@@ -382,9 +390,10 @@ impl Panel {
         let report = build_report(&st);
         Self {
             st,
-            charts: load_charts(14, "devin"),
+            charts: load_charts(14, "devin", None),
             days: 14,
             tab: "devin",
+            device: None,
             report,
             logo: None,
             sel_day: None,
@@ -416,6 +425,7 @@ impl Panel {
             "antigravity" => "Antigravity",
             "zcode" => "ZCode",
             "grok" => "Grok",
+            "claude" => "Claude",
             x => x,
         };
         let Some(ap) = self.st.apps.get(self.tab) else {
@@ -621,7 +631,7 @@ impl Panel {
     /// 选中某天的明细块（分模型）
     fn day_detail(&self, ui: &mut egui::Ui) {
         let Some(ymd) = &self.sel_day else { return };
-        let (n_sess, rows) = load_day_detail(ymd, self.tab);
+        let (n_sess, rows) = load_day_detail(ymd, self.tab, self.device.as_deref());
         ui.add_space(4.0);
         ui.separator();
         ui.add_space(4.0);
@@ -823,8 +833,8 @@ impl eframe::App for Panel {
                 .collecting
                 .is_some_and(|t| t.elapsed() >= COLLECT_DELAY);
         if due {
-            self.st = load_stats();
-            self.charts = load_charts(self.days, self.tab);
+            self.st = load_stats(self.device.as_deref());
+            self.charts = load_charts(self.days, self.tab, self.device.as_deref());
             self.report = build_report(&self.st);
             self.reloaded = Instant::now();
             self.collecting = None;
@@ -867,11 +877,17 @@ impl eframe::App for Panel {
                 }
                 key => {
                     if let Some(ap) = self.st.apps.get(key) {
+                        let an = match key {
+                            "cursor" => "Cursor",
+                            "antigravity" => "Antigravity",
+                            "zcode" => "ZCode",
+                            "grok" => "Grok",
+                            "claude" => "Claude",
+                            x => x,
+                        };
                         let mut s = format!(
                             "{} 估算成本: 近7天 ${:.2} · 累计 ${:.2}",
-                            if key == "cursor" { "Cursor" } else { "Antigravity" },
-                            ap.usd_7d,
-                            ap.usd_all
+                            an, ap.usd_7d, ap.usd_all
                         );
                         if ap.real_usd_all > 0.0 {
                             s += &format!(" · 订阅外实扣 ${:.2}", ap.real_usd_all);
@@ -948,16 +964,43 @@ impl eframe::App for Panel {
                     ("antigravity", "Antigravity"),
                     ("zcode", "ZCode"),
                     ("grok", "Grok"),
+                    ("claude", "Claude"),
                 ] {
                     if ui.selectable_label(self.tab == key, label).clicked()
                         && self.tab != key
                     {
                         self.tab = key;
-                        self.charts = load_charts(self.days, self.tab);
+                        self.charts = load_charts(self.days, self.tab, self.device.as_deref());
                         self.sel_day = None;
                     }
                 }
             });
+            // 设备切换（多设备同步后才有 >1 个选项）
+            if self.st.devices.len() > 1 {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("设备").weak().small());
+                    if ui
+                        .selectable_label(self.device.is_none(), "全部")
+                        .clicked()
+                        && self.device.is_some()
+                    {
+                        self.device = None;
+                        self.st = load_stats(None);
+                        self.charts = load_charts(self.days, self.tab, None);
+                        self.sel_day = None;
+                    }
+                    for d in self.st.devices.clone() {
+                        let sel = self.device.as_deref() == Some(d.as_str());
+                        if ui.selectable_label(sel, &d).clicked() && !sel {
+                            self.device = Some(d.clone());
+                            self.st = load_stats(Some(&d));
+                            self.charts =
+                                load_charts(self.days, self.tab, Some(&d));
+                            self.sel_day = None;
+                        }
+                    }
+                });
+            }
             ui.add_space(2.0);
 
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1022,7 +1065,8 @@ impl eframe::App for Panel {
                                         && self.days != d
                                     {
                                         self.days = d;
-                                        self.charts = load_charts(d, self.tab);
+                                        self.charts = load_charts(
+                                            d, self.tab, self.device.as_deref());
                                     }
                                 }
                             },
@@ -1115,6 +1159,7 @@ impl eframe::App for Panel {
                                 "antigravity" => "Antigravity",
                                 "zcode" => "ZCode",
                                 "grok" => "Grok",
+                                "claude" => "Claude",
                                 x => x,
                             };
                             if ap.quota_rows.is_empty() {
@@ -1168,6 +1213,7 @@ impl eframe::App for Panel {
                                         "antigravity" => "Antigravity",
                                         "zcode" => "ZCode",
                                         "grok" => "Grok",
+                                        "claude" => "Claude",
                                         x => x,
                                     };
                                     let a = &ap.total_all;

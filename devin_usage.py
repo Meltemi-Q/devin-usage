@@ -30,6 +30,7 @@ import base64
 import json
 import os
 import re
+import socket
 import sqlite3
 import ssl
 import subprocess
@@ -74,6 +75,9 @@ DEVIN_API = "https://api.devin.ai"
 GUS_RPC = f"{API_SERVER}/exa.seat_management_pb.SeatManagementService/GetUserStatus"
 
 UA = "devin-usage/1.0"
+
+# 本机设备标识：USAGE_DEVICE 环境变量可覆盖（用于多设备汇总区分来源）
+DEVICE = os.environ.get("USAGE_DEVICE") or socket.gethostname() or "unknown"
 
 
 # ---------------------------------------------------------------- creds
@@ -199,12 +203,29 @@ CREATE INDEX IF NOT EXISTS idx_events_model ON usage_events(app, model);
 def db() -> sqlite3.Connection:
     DATA_DIR.mkdir(exist_ok=True)
     c = sqlite3.connect(DB_PATH)
+    # daily_activity 老表主键无 device——重建（PK 无法用 ALTER 改）
+    da_cols = {r[1] for r in c.execute("PRAGMA table_info(daily_activity)")}
+    if da_cols and "device" not in da_cols:
+        c.execute("ALTER TABLE daily_activity RENAME TO daily_activity_old")
+        c.executescript("""CREATE TABLE daily_activity (
+          app TEXT NOT NULL, day TEXT NOT NULL, metric TEXT NOT NULL, value INTEGER,
+          device TEXT DEFAULT '', PRIMARY KEY(app, day, metric, device));
+          INSERT OR REPLACE INTO daily_activity (app,day,metric,value,device)
+            SELECT app,day,metric,value,'' FROM daily_activity_old;
+          DROP TABLE daily_activity_old;""")
+        c.commit()
     c.executescript(SCHEMA)
     # 轻量迁移：老库补 token 列
     have = {r[1] for r in c.execute("PRAGMA table_info(local_sessions)")}
     for col in ("tok_in", "tok_out", "tok_cache_read", "tok_cache_write", "gen_ms"):
         if col not in have:
             c.execute(f"ALTER TABLE local_sessions ADD COLUMN {col} INTEGER")
+    # 多设备标签列（Rust 采集器已用；此处同步迁移保持兼容）
+    for tbl in ("usage_events", "app_quota", "local_sessions",
+                "cloud_sessions", "quota_snapshots", "daily_activity"):
+        cols = {r[1] for r in c.execute(f"PRAGMA table_info({tbl})")}
+        if "device" not in cols:
+            c.execute(f"ALTER TABLE {tbl} ADD COLUMN device TEXT DEFAULT ''")
     # 一次性修正：grok/zcode/antigravity 旧行的 tok_in 含缓存，扣除重复部分
     if not c.execute(
             "SELECT 1 FROM kv WHERE key='fix_cache_dedup_v1'").fetchone():
@@ -214,6 +235,23 @@ def db() -> sqlite3.Connection:
         c.execute("INSERT OR REPLACE INTO kv VALUES('fix_cache_dedup_v1','1')")
         c.commit()
     return c
+
+
+def device() -> str:
+    """本机标签（同步汇总的行归属标识）。"""
+    return os.environ.get("USAGE_DEVICE") or os.environ.get(
+        "COMPUTERNAME") or os.environ.get("HOSTNAME") or \
+        subprocess.run(["hostname"], capture_output=True, text=True
+                       ).stdout.strip() or "unknown"
+
+
+def _tag_device(c):
+    """collect 末尾：本机新采的未打标签行统一补 device。"""
+    for tbl in ("usage_events", "local_sessions", "app_quota",
+                "cloud_sessions", "quota_snapshots", "daily_activity"):
+        c.execute(f"UPDATE {tbl} SET device=? WHERE device IS NULL OR device=''",
+                  (device(),))
+    c.commit()
 
 
 def log_run(c, source, status, detail=""):
@@ -260,7 +298,11 @@ def collect_quota(c, token):
     # 5 分钟内重复 collect 不重复写快照
     last = c.execute("SELECT MAX(ts) FROM quota_snapshots").fetchone()[0] or 0
     if now - last >= 300:
-        c.execute("""INSERT INTO quota_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        c.execute("""INSERT INTO quota_snapshots
+            (ts,plan_name,teams_tier,weekly_quota_remaining_pct,
+             overage_balance_micros,available_prompt_credits,plan_start,plan_end,
+             daily_reset,weekly_reset,n_models,raw_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                   (now, pi.get("planName"), pi.get("teamsTier"),
                    ps.get("weeklyQuotaRemainingPercent"),
                    _int(ps.get("overageBalanceMicros")),
@@ -608,8 +650,10 @@ def _collect_cursor_local(c) -> int:
             for metric in ("tabSuggestedLines", "tabAcceptedLines",
                            "composerSuggestedLines", "composerAcceptedLines"):
                 if metric in d:
-                    c.execute("INSERT OR REPLACE INTO daily_activity VALUES('cursor',?,?,?)",
-                              (day, metric, int(d[metric] or 0)))
+                    c.execute("INSERT OR REPLACE INTO daily_activity "
+                              "(app,day,metric,value,device) "
+                              "VALUES('cursor',?,?,?,?)",
+                              (day, metric, int(d[metric] or 0), device()))
         except Exception:
             continue
     src.close()
@@ -640,7 +684,9 @@ def _cursor_usage_summary(c, token) -> int:
     n = 0
     tot = plan.get("totalPercentUsed")
     if tot is not None:
-        c.execute("INSERT OR REPLACE INTO app_quota VALUES('cursor','plan',?,?,?,?,?,?)",
+        c.execute("INSERT OR REPLACE INTO app_quota "
+                  "(app,label,ts,pct_remaining,used,lim,resets_at,meta) "
+                  "VALUES('cursor','plan',?,?,?,?,?,?)",
                   (now, 100.0 - float(tot), plan.get("used"), plan.get("limit"), resets,
                    json.dumps({"membership": j.get("membershipType"),
                                "auto_pct": plan.get("autoPercentUsed"),
@@ -649,7 +695,9 @@ def _cursor_usage_summary(c, token) -> int:
     for label, key in (("auto", "autoPercentUsed"), ("api", "apiPercentUsed")):
         p = plan.get(key)
         if p is not None:
-            c.execute("INSERT OR REPLACE INTO app_quota VALUES('cursor',?,?,?,?,?,?,?)",
+            c.execute("INSERT OR REPLACE INTO app_quota "
+                      "(app,label,ts,pct_remaining,used,lim,resets_at,meta) "
+                      "VALUES('cursor',?,?,?,?,?,?,?)",
                       (label, now, 100.0 - float(p), None, None, resets, None))
             n += 1
     if j.get("membershipType"):
@@ -971,6 +1019,7 @@ def collect_antigravity_quota(c) -> int:
                         resets = None
                     win = "周" if b.get("window") == "weekly" else "5h"
                     c.execute("INSERT OR REPLACE INTO app_quota "
+                              "(app,label,ts,pct_remaining,used,lim,resets_at,meta) "
                               "VALUES('antigravity',?,?,?,?,?,?,?)",
                               (f"{pool} · {win}", now, frac * 100,
                                None, None, resets, "{}"))
@@ -1187,7 +1236,9 @@ def collect_grok_quota(c) -> int:
     n = 0
     used = cfg.get("creditUsagePercent")
     if used is not None:
-        c.execute("INSERT OR REPLACE INTO app_quota VALUES('grok','周额度',?,?,?,?,?,?)",
+        c.execute("INSERT OR REPLACE INTO app_quota "
+                  "(app,label,ts,pct_remaining,used,lim,resets_at,meta) "
+                  "VALUES('grok','周额度',?,?,?,?,?,?)",
                   (now, max(0.0, 100.0 - float(used)), float(used), 100.0,
                    resets, meta))
         n += 1
@@ -1195,7 +1246,9 @@ def collect_grok_quota(c) -> int:
         u = pu.get("usagePercent")
         if u is None:
             continue
-        c.execute("INSERT OR REPLACE INTO app_quota VALUES('grok',?,?,?,?,?,?,?)",
+        c.execute("INSERT OR REPLACE INTO app_quota "
+                  "(app,label,ts,pct_remaining,used,lim,resets_at,meta) "
+                  "VALUES('grok',?,?,?,?,?,?,?)",
                   (pu.get("product") or "?", now, max(0.0, 100.0 - float(u)),
                    float(u), 100.0, resets, None))
         n += 1
@@ -1277,6 +1330,79 @@ def collect_grok(c) -> int:
         except Exception:
             continue
     log_run(c, "grok", "ok", f"{n_sess} sessions, +{n_ev} events")
+    return n_sess
+
+
+def collect_claude(c) -> int:
+    """~/.claude/projects/**/*.jsonl → usage_events + local_sessions。
+    assistant 消息 message.usage 为 Anthropic 真实计费口径；
+    input_tokens 不含缓存（无需扣除）。流式重复写 → 按 message.id 去重。"""
+    root = Path.home() / ".claude/projects"
+    if not root.exists():
+        log_run(c, "claude", "skip", "~/.claude/projects 不存在")
+        return 0
+    n_ev = 0
+    sess = {}                                    # sessionId → 聚合
+    seen = set()                                 # 本批内 message.id 去重
+    for fp in root.glob("**/*.jsonl"):
+        try:
+            for e in _read_jsonl_incremental(c, "claude", fp):
+                msg = e.get("message") or {}
+                u = msg.get("usage") or {}
+                if not u.get("output_tokens"):
+                    continue
+                mid = msg.get("id") or e.get("uuid")
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                sid = e.get("sessionId") or fp.stem
+                ts = _iso_ts(e.get("timestamp")) or 0
+                day = (datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                       if ts else "1970-01-01")
+                model = msg.get("model") or "?"
+                i_ = u.get("input_tokens") or 0
+                o_ = u.get("output_tokens") or 0
+                cr = u.get("cache_read_input_tokens") or 0
+                cw = u.get("cache_creation_input_tokens") or 0
+                st = u.get("server_tool_use") or {}
+                cur = c.execute("""INSERT OR IGNORE INTO usage_events
+                    (app,event_key,ts,day,model,kind,session_id,
+                     tok_in,tok_out,tok_cache_read,tok_cache_write,cost_usd,meta)
+                    VALUES('claude',?,?,?,?,'gen',?,?,?,?,?,NULL,?)""",
+                    (mid, ts, day, model, f"claude:{sid}", i_, o_, cr, cw,
+                     json.dumps({"ws": st.get("web_search_requests"),
+                                 "wf": st.get("web_fetch_requests"),
+                                 "tier": u.get("service_tier")})))
+                n_ev += cur.rowcount
+                s = sess.setdefault(sid, {"model": model, "n": 0,
+                                          "t0": ts, "t1": ts,
+                                          "cwd": e.get("cwd") or "",
+                                          "ti": 0, "to": 0, "tcr": 0, "tcw": 0})
+                s["n"] += 1
+                s["model"] = model if model != "?" else s["model"]
+                s["t0"] = min(s["t0"], ts); s["t1"] = max(s["t1"], ts)
+                s["ti"] += i_; s["to"] += o_; s["tcr"] += cr; s["tcw"] += cw
+        except Exception:
+            continue
+    now = int(time.time())
+    n_sess = 0
+    for sid, s in sess.items():
+        title = Path(s["cwd"]).name if s["cwd"] else sid
+        c.execute("""INSERT INTO local_sessions
+            (session_id,source,model,title,cwd,created_at,last_activity_at,
+             n_user,n_assistant,n_tool,n_system,n_tool_calls,n_prompts,
+             tok_in,tok_out,tok_cache_read,tok_cache_write,first_seen,last_seen)
+            VALUES (?, 'claude', ?, ?, ?, ?, ?, 0, ?, 0,0,0,0, ?,?,?,?, ?,?)
+            ON CONFLICT(session_id) DO UPDATE SET
+             model=excluded.model, last_activity_at=excluded.last_activity_at,
+             n_assistant=excluded.n_assistant, tok_in=excluded.tok_in,
+             tok_out=excluded.tok_out, tok_cache_read=excluded.tok_cache_read,
+             tok_cache_write=excluded.tok_cache_write, last_seen=excluded.last_seen""",
+            (f"claude:{sid}", s["model"], title, s["cwd"],
+             s["t0"], s["t1"], s["n"],
+             s["ti"], s["to"], s["tcr"], s["tcw"], now, now))
+        n_sess += 1
+    log_run(c, "claude", "ok", f"{n_sess} sessions, +{n_ev} events")
     return n_sess
 
 
@@ -1366,7 +1492,8 @@ def cmd_collect(args):
                      ("cursor", lambda: collect_cursor(c)),
                      ("antigravity", lambda: collect_antigravity(c)),
                      ("zcode", lambda: collect_zcode(c)),
-                     ("grok", lambda: collect_grok(c))):
+                     ("grok", lambda: collect_grok(c)),
+                     ("claude", lambda: collect_claude(c))):
         if args.only and name != args.only:
             continue
         if name in ("quota", "cloud") and not token:
@@ -1378,6 +1505,7 @@ def cmd_collect(args):
         except Exception as e:
             log_run(c, name, "error", str(e))
             results[name] = f"ERROR: {e}"
+    _tag_device(c)
     c.commit()
     print(f"collect done in {time.time()-t0:.1f}s: {results}")
 
@@ -1407,7 +1535,8 @@ def cmd_quota(args):
     row = c.execute("""SELECT * FROM quota_snapshots ORDER BY ts DESC LIMIT 1""").fetchone()
     if not row:
         print("还没有配额快照，先跑 collect"); return
-    (ts, plan, tier, wq, ov, pc, ps, pe, dr, wr, nm, _raw) = row
+    # 前 12 列固定；后续列（device 等）忽略
+    (ts, plan, tier, wq, ov, pc, ps, pe, dr, wr, nm, _raw) = row[:12]
     ov_usd = (ov or 0) / 1e6
     print(f"[{_ts(ts)}] plan={plan}({tier})  promptCredits={'∞' if pc == -1 else pc}")
     print(f"  周配额剩余: {wq}%   (重置 {_ts(wr)})")
