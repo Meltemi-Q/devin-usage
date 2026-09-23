@@ -1252,40 +1252,31 @@ impl eframe::App for Panel {
                     ui.add_space(6.0);
                 }
 
-                // ---- Token 构成卡片（按当前应用；"all" 为双源合并）
+                // ---- Token 构成卡片（跟随当前 Tab + 时间区间）
                 card(ui, |ui| {
-                    let mut combined = self.st.total_all.clone();
-                    for ap in self.st.apps.values() {
-                        let a = &ap.total_all;
-                        combined.sessions += a.sessions;
-                        combined.tin += a.tin;
-                        combined.tout += a.tout;
-                        combined.tcr += a.tcr;
-                        combined.tcw += a.tcw;
+                    let mut rt = Agg::default();
+                    for d in &self.charts.daily {
+                        rt.tin += d.vals[0] as i64;
+                        rt.tout += d.vals[1] as i64;
+                        rt.tcr += d.vals[2] as i64;
+                        rt.tcw += d.vals[3] as i64;
                     }
-                    let t = match self.tab {
-                        "devin" => &self.st.total_all,
-                        key => self
-                            .st
-                            .apps
-                            .get(key)
-                            .map(|a| &a.total_all)
-                            .unwrap_or(&combined),
+                    let sum = rt.tin + rt.tout + rt.tcr + rt.tcw;
+                    let label = if self.days > 0 {
+                        format!("近{}天 {}", self.days, tok_zh(sum))
+                    } else {
+                        format!("累计 {}", tok_zh(sum))
                     };
-                    let sum = t.tin + t.tout + t.tcr + t.tcw;
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Token 构成").strong());
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("累计 {}", tok_zh(sum)))
-                                        .strong(),
-                                );
+                                ui.label(egui::RichText::new(label).strong());
                             },
                         );
                     });
-                    self.mix_strip(ui, t);
+                    self.mix_strip(ui, &rt);
                 });
                 ui.add_space(6.0);
 
