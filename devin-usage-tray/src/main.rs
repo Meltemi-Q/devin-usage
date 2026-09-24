@@ -196,11 +196,13 @@ pub fn open_db() -> Option<Connection> {
     if !db.is_file() {
         return None;
     }
-    Connection::open_with_flags(
+    let c = Connection::open_with_flags(
         db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .ok()
+    .ok()?;
+    let _ = c.execute_batch("PRAGMA busy_timeout=5000;");
+    Some(c)
 }
 
 #[cfg(feature = "gui")]

@@ -370,15 +370,26 @@ fn tok_zh(v: i64) -> String {
 
 // ---------------------------------------------------------------- 面板
 
+/// 当日明细（选中日 ymd + load_day_detail 的会话数与模型行）
+type DetailRows = (String, i64, Vec<(String, i64, i64, i64, i64, i64)>);
+/// 后台刷新产物：统计 + 日图 + 模型表 + 当日明细
+type RefreshOut = (Stats, Charts, Vec<ModelRow>, Option<DetailRows>);
+/// 视图键：(tab, device, days, sel_day)——任一变化即触发后台重载
+type ViewKey = (&'static str, Option<String>, i64, Option<String>);
+
 struct Panel {
     st: Stats,
     charts: Charts,
+    models: Vec<ModelRow>,          // 模型族表缓存（上次后台加载结果）
+    detail: Option<DetailRows>,     // 选中日明细缓存
     days: i64, // 图表回看范围：7/14/30/90，0=全部
     tab: &'static str, // "devin" | "cursor" | ... 各应用套餐独立
     device: Option<String>, // 设备过滤：None=全部设备
     report: String,
     logo: Option<egui::TextureHandle>,
     sel_day: Option<String>, // 图表中选中的日期（点柱子/下拉）
+    pending: Option<std::sync::mpsc::Receiver<RefreshOut>>,
+    loaded_key: ViewKey,
     reloaded: Instant,
     collecting: Option<Instant>,
     on_top: bool,
@@ -486,13 +497,18 @@ impl Panel {
         let report = build_report(&st);
         Self {
             st,
-            charts: load_charts(14, "devin", None),
+            charts: Charts::default(),
+            models: Vec::new(),
+            detail: None,
             days: 14,
             tab: "devin",
             device: None,
             report,
             logo: None,
             sel_day: None,
+            pending: None,
+            // 初始键与首帧真实键必不同 → 首帧自动起后台加载
+            loaded_key: ("", None, -1, None),
             reloaded: Instant::now(),
             collecting: None,
             on_top: false,
@@ -726,10 +742,13 @@ impl Panel {
         }
     }
 
-    /// 选中某天的明细块（分模型）
+    /// 选中某天的明细块（分模型）——读后台加载的缓存，不在 UI 线程查库
     fn day_detail(&self, ui: &mut egui::Ui) {
         let Some(ymd) = &self.sel_day else { return };
-        let (n_sess, rows) = load_day_detail(ymd, self.tab, self.device.as_deref());
+        let Some((d_ymd, n_sess, rows)) = &self.detail else { return };
+        if d_ymd != ymd {
+            return; // 缓存是旧选日期的，新结果在路上
+        }
         ui.add_space(4.0);
         ui.separator();
         ui.add_space(4.0);
@@ -740,6 +759,7 @@ impl Panel {
             ui.label(egui::RichText::new("当日无会话").weak().small());
             return;
         }
+        let rows = rows.clone();
         egui::Grid::new("daydetail")
             .num_columns(6)
             .spacing([10.0, 3.0])
@@ -926,16 +946,55 @@ impl Panel {
 
 impl eframe::App for Panel {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let due = self.reloaded.elapsed() >= RELOAD
-            || self
-                .collecting
-                .is_some_and(|t| t.elapsed() >= COLLECT_DELAY);
-        if due {
-            self.st = load_stats(self.device.as_deref());
-            self.charts = load_charts(self.days, self.tab, self.device.as_deref());
-            self.report = build_report(&self.st);
-            self.reloaded = Instant::now();
+        // 收后台刷新结果（SQL 全在工作线程跑，UI 永不阻塞）
+        if let Some(rx) = &self.pending {
+            match rx.try_recv() {
+                Ok((st, ch, ms, dt)) => {
+                    self.report = build_report(&st);
+                    self.st = st;
+                    self.charts = ch;
+                    self.models = ms;
+                    self.detail = dt;
+                    self.reloaded = Instant::now();
+                    self.collecting = None;
+                    self.pending = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending = None,
+            }
+        }
+        // 视图键变化（tab/设备/天数/选中日）或定时/采集后延迟到点 → 后台重载
+        let key: ViewKey = (
+            self.tab,
+            self.device.clone(),
+            self.days,
+            self.sel_day.clone(),
+        );
+        let collect_due = self
+            .collecting
+            .is_some_and(|t| t.elapsed() >= COLLECT_DELAY);
+        if self.pending.is_none()
+            && (key != self.loaded_key
+                || self.reloaded.elapsed() >= RELOAD
+                || collect_due)
+        {
+            self.loaded_key = key.clone();
             self.collecting = None;
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.pending = Some(rx);
+            let (tab, dev, days, sel) = (key.0, key.1, key.2, key.3);
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let st = load_stats(dev.as_deref());
+                let ch = load_charts(days, tab, dev.as_deref());
+                let ms = load_models(tab, dev.as_deref(), sel.as_deref(), days);
+                let dt = sel.as_deref().map(|y| {
+                    let (n, rows) = load_day_detail(y, tab, dev.as_deref());
+                    (y.to_string(), n, rows)
+                });
+                let _ = tx.send((st, ch, ms, dt));
+                ctx2.request_repaint();
+            });
         }
         if self.logo.is_none() {
             if let Ok(img) = image::load_from_memory(crate::LOGO_PNG) {
@@ -1075,14 +1134,13 @@ impl eframe::App for Panel {
                         && self.tab != key
                     {
                         self.tab = key;
-                        self.charts = load_charts(self.days, self.tab, self.device.as_deref());
                         self.sel_day = None;
                     }
                 }
             });
-            // 设备切换（多设备同步后才有 >1 个选项）
+            // 设备切换（多设备同步后才有 >1 个选项；wrapped 防超宽溢出）
             if self.st.devices.len() > 1 {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("设备").weak().small());
                     if ui
                         .selectable_label(self.device.is_none(), "全部")
@@ -1090,17 +1148,12 @@ impl eframe::App for Panel {
                         && self.device.is_some()
                     {
                         self.device = None;
-                        self.st = load_stats(None);
-                        self.charts = load_charts(self.days, self.tab, None);
                         self.sel_day = None;
                     }
                     for d in self.st.devices.clone() {
                         let sel = self.device.as_deref() == Some(d.as_str());
                         if ui.selectable_label(sel, &d).clicked() && !sel {
                             self.device = Some(d.clone());
-                            self.st = load_stats(Some(&d));
-                            self.charts =
-                                load_charts(self.days, self.tab, Some(&d));
                             self.sel_day = None;
                         }
                     }
@@ -1170,8 +1223,7 @@ impl eframe::App for Panel {
                                         && self.days != d
                                     {
                                         self.days = d;
-                                        self.charts = load_charts(
-                                            d, self.tab, self.device.as_deref());
+                                        self.sel_day = None;
                                     }
                                 }
                             },
@@ -1448,14 +1500,9 @@ impl eframe::App for Panel {
                 });
                 ui.add_space(6.0);
 
-                // ---- 模型族卡片（跟随选中日期/区间；事件级口径）
+                // ---- 模型族卡片（跟随选中日期/区间；读后台缓存）
                 card(ui, |ui| {
-                    let models = load_models(
-                        self.tab,
-                        self.device.as_deref(),
-                        self.sel_day.as_deref(),
-                        self.days,
-                    );
+                    let models = &self.models;
                     let scope = self.sel_day.clone().unwrap_or_else(|| {
                         if self.days > 0 {
                             format!("近{}天", self.days)
@@ -1491,7 +1538,7 @@ impl eframe::App for Panel {
                                 .weak(),
                         );
                     } else {
-                        self.model_table(ui, &models, note);
+                        self.model_table(ui, models, note);
                     }
                 });
                 ui.add_space(6.0);

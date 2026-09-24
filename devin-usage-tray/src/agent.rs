@@ -417,6 +417,9 @@ CREATE INDEX IF NOT EXISTS idx_quota_app_ts ON app_quota(app, ts);
 
 pub fn open_db() -> Option<Connection> {
     let c = Connection::open(db_path()).ok()?;
+    // WAL：读者永不被写者挡（面板 60s 刷新 vs collect 写入并发）；
+    // busy_timeout 兜底写者互等。journal_mode 是持久设置，一次即可。
+    let _ = c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
     // daily_activity 老表主键无 device——重建（PK 无法用 ALTER 改）
     {
         let da_cols: Vec<String> = c
@@ -2590,12 +2593,20 @@ pub fn import_cli() {
     if stdin.lock().read_to_string(&mut buf).is_err() {
         return;
     }
-    let Ok(tx) = c.transaction() else { return };
+    let mut tx = match c.transaction() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
     for line in buf.lines() {
         let Ok(e) = serde_json::from_str::<Value>(line) else { continue };
         let (Some(t), Some(r)) = (vstr(&e, "t"), e["r"].as_object()) else { continue };
         import_row(&tx, &t, r);
         n += 1;
+        if n % 2000 == 0 {
+            let _ = tx.commit();
+            let Ok(ntx) = c.transaction() else { return };
+            tx = ntx;
+        }
     }
     let _ = tx.commit();
     eprintln!("import: {n} rows");
@@ -2699,8 +2710,12 @@ pub fn sync_cli() {
         let txt = String::from_utf8_lossy(&o.stdout);
         let mut n = 0;
         let mut max_wm: std::collections::HashMap<String, i64> = Default::default();
+        // 分批提交：单个大事务会长时间占写锁，冻住面板/托盘的读查询
         {
-            let Ok(tx) = c.transaction() else { return };
+            let mut tx = match c.transaction() {
+                Ok(t) => t,
+                Err(_) => return,
+            };
             for line in txt.lines() {
                 if let Ok(e) = serde_json::from_str::<Value>(line) {
                     if let (Some(t), Some(r)) = (vstr(&e, "t"), e["r"].as_object()) {
@@ -2713,6 +2728,11 @@ pub fn sync_cli() {
                             *e = (*e).max(v);
                         }
                         n += 1;
+                        if n % 2000 == 0 {
+                            let _ = tx.commit();
+                            let Ok(ntx) = c.transaction() else { return };
+                            tx = ntx;
+                        }
                     }
                 }
             }
