@@ -1678,6 +1678,14 @@ def _f(v):
 
 def cmd_collect(args):
     c = db()
+    # 同步水位按 rowid/last_seen 记：delete+重插会复用低位 rowid 使新行
+    # 低于已确认水位永远导不出去；此类迁移后必须重置水位全量重发
+    if not c.execute(
+            "SELECT value FROM kv WHERE key='sync_wm_reset_v1'").fetchone():
+        c.execute("""DELETE FROM kv WHERE key LIKE 'exp:to:%'
+                      OR key LIKE 'exp:for:%' OR key LIKE 'have:%'""")
+        c.execute("INSERT OR REPLACE INTO kv VALUES('sync_wm_reset_v1','1')")
+        c.commit()
     token = None
     try:
         token = read_token()

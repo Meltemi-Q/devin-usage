@@ -2892,6 +2892,17 @@ pub fn collect_cli(only: Option<&str>) {
             return;
         }
     };
+    // 同步水位按 rowid/last_seen 记：任何 delete+重插迁移会复用低位 rowid，
+    // 使新行低于已确认水位、永远导不出去。此类迁移后必须重置水位全量重发
+    //（INSERT OR IGNORE/ON CONFLICT 去重保证重发安全）。
+    if kv_get(&c, "sync_wm_reset_v1").is_none() {
+        let _ = c.execute(
+            "DELETE FROM kv WHERE key LIKE 'exp:to:%' OR key LIKE 'exp:for:%'
+              OR key LIKE 'have:%'",
+            [],
+        );
+        kv_set(&c, "sync_wm_reset_v1", "1");
+    }
     let token = read_token();
     if token.is_none() {
         log_run(&c, "auth", "error", "找不到 token");
