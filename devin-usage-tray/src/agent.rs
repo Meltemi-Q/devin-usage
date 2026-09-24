@@ -2190,15 +2190,38 @@ fn collect_codex(c: &Connection) -> i64 {
     // turn_id -> model（turn_context 在其响应之前出现）
     let mut turn_model: std::collections::HashMap<String, String> = Default::default();
     let mut sess: std::collections::HashMap<String, Value> = Default::default();
+    // 老格式（event_msg/token_count.last_token_usage）回填：先删偏移全量重扫一次。
+    // 删除必须确认成功（并发写入会让 DELETE 静默失败，导致旧文件偏移残留、整文件漏采）
+    if kv_get(c, "codex_tc_v3").is_none() {
+        // 重试确保删除成功；清掉 v2 未补零的旧 tc 行以免与新键重复
+        for sql in ["DELETE FROM kv WHERE key LIKE 'off:codex:%'",
+                    "DELETE FROM usage_events WHERE app='codex' AND event_key LIKE 'codex:tc:%'"] {
+            for _ in 0..20 {
+                if c.execute(sql, []).is_ok() { break; }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+        kv_set(c, "codex_tc_v3", "1");
+    }
     for fp in files {
+        let stem = fp.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        // 混合格式文件的分界 ordinal：token_usage_record 首次出现处起，
+        // 之后的 token_count 与 record 是同一批 turn 的双写 -> 跳过。
+        let recmin_key = format!("recmin:codex:{stem}");
+        let mut rec_min: Option<i64> =
+            kv_get(c, &recmin_key).and_then(|v| v.parse().ok());
+        let mut cur_sid: Option<String> = None;
+        let mut cur_model: Option<String> = None;
+        let mut cur_provider = "codex".to_string();
         for e in read_jsonl_incremental(c, "codex", &fp) {
             let ts = iso_ts(&e["timestamp"]).unwrap_or(0);
             let pay = &e["payload"];
             match vstr(&e, "type").as_deref() {
                 Some("session_meta") => {
                     let sid = vstr(pay, "session_id").or_else(|| vstr(pay, "id"))
-                        .unwrap_or_else(|| fp.file_stem().unwrap_or_default()
-                            .to_string_lossy().into());
+                        .unwrap_or_else(|| stem.clone());
+                    cur_sid = Some(sid.clone());
+                    if let Some(p) = vstr(pay, "model_provider") { cur_provider = p; }
                     let s = sess.entry(sid).or_insert(json!({
                         "model": "?", "n": 0, "t0": ts, "t1": ts,
                         "cwd": "", "provider": "codex",
@@ -2212,10 +2235,24 @@ fn collect_codex(c: &Connection) -> i64 {
                     if let (Some(tid), Some(m)) =
                         (vstr(pay, "turn_id"), vstr(pay, "model"))
                     {
+                        cur_model = Some(m.clone());
                         turn_model.insert(tid, m);
                     }
                 }
                 Some("token_usage_record") => {
+                    // 更新双格式分界：record 首次出现的 ordinal 起 tc 视为重复
+                    if let Some(o) = opt_i64(&e["ordinal"]) {
+                        if rec_min.map_or(true, |m| o < m) {
+                            rec_min = Some(o);
+                            kv_set(c, &recmin_key, &o.to_string());
+                            let _ = c.execute(
+                                "DELETE FROM usage_events
+                                 WHERE event_key LIKE ? AND event_key >= ?",
+                                [format!("codex:tc:{stem}:%"),
+                                 format!("codex:tc:{stem}:{o:010}")],
+                            );
+                        }
+                    }
                     let rid = vstr(pay, "response_id");
                     let Some(rid) = rid else { continue };
                     let sid = vstr(pay, "session_id").or_else(|| vstr(pay, "thread_id"))
@@ -2266,6 +2303,53 @@ fn collect_codex(c: &Connection) -> i64 {
                 Some("event_msg") => {
                     // rate_limits（ChatGPT 直连账号才有；走代理时为 null）
                     if vstr(pay, "type").as_deref() != Some("token_count") { continue; }
+                    // 老格式用量：info.last_token_usage 为每轮增量。
+                    // 分界 ordinal 之后与 token_usage_record 双写 -> 跳过防双计
+                    let ord = opt_i64(&e["ordinal"]).unwrap_or(ts);
+                    if rec_min.map_or(true, |m| ord < m) {
+                        let lu = &pay["info"]["last_token_usage"];
+                        let inp = opt_i64(&lu["input_tokens"]).unwrap_or(0);
+                        let cr = opt_i64(&lu["cached_input_tokens"]).unwrap_or(0);
+                        let cw = opt_i64(&lu["cache_write_input_tokens"]).unwrap_or(0);
+                        let o = opt_i64(&lu["output_tokens"]).unwrap_or(0);
+                        let rs = opt_i64(&lu["reasoning_output_tokens"]).unwrap_or(0);
+                        if inp + cr + cw + o > 0 {
+                            let i_ = (inp - cr - cw).max(0);
+                            let sid = cur_sid.clone().unwrap_or_else(|| stem.clone());
+                            let model = cur_model.clone().unwrap_or_else(|| "?".into());
+                            let meta = json!({"reasoning": rs, "fmt": "token_count",
+                                              "provider": cur_provider.as_str()});
+                            let rc = c.execute(
+                                "INSERT OR IGNORE INTO usage_events
+                                 (app,event_key,ts,day,model,kind,session_id,
+                                  tok_in,tok_out,tok_cache_read,tok_cache_write,cost_usd,meta,device)
+                                 VALUES('codex',?,?,?,?,?,?,?,?,?,?,NULL,?,?)",
+                                params![
+                                    format!("codex:tc:{stem}:{ord:010}"), ts,
+                                    day_of(ts), model, cur_provider,
+                                    format!("codex:{sid}"), i_, o, cr, cw,
+                                    meta.to_string(), device()
+                                ],
+                            ).unwrap_or_else(|e| {
+                                eprintln!("codex tc insert 失败 {stem}:{ord}: {e}");
+                                0
+                            });
+                            n_ev += rc as i64;
+                            let s = sess.entry(sid.clone()).or_insert(json!({
+                                "model": "?", "n": 0, "t0": ts, "t1": ts,
+                                "cwd": "", "provider": "codex",
+                                "ti": 0, "to": 0, "tcr": 0, "tcw": 0
+                            }));
+                            s["n"] = json!(opt_i64(&s["n"]).unwrap_or(0) + 1);
+                            if model != "?" { s["model"] = json!(model); }
+                            s["t0"] = json!(opt_i64(&s["t0"]).unwrap_or(ts).min(ts));
+                            s["t1"] = json!(opt_i64(&s["t1"]).unwrap_or(ts).max(ts));
+                            s["ti"] = json!(opt_i64(&s["ti"]).unwrap_or(0) + i_);
+                            s["to"] = json!(opt_i64(&s["to"]).unwrap_or(0) + o);
+                            s["tcr"] = json!(opt_i64(&s["tcr"]).unwrap_or(0) + cr);
+                            s["tcw"] = json!(opt_i64(&s["tcw"]).unwrap_or(0) + cw);
+                        }
+                    }
                     let rl = &pay["rate_limits"];
                     for lk in ["primary", "secondary"] {
                         let w = &rl[lk];
@@ -2793,6 +2877,21 @@ pub fn collect_cli(only: Option<&str>) {
         eprintln!("db 打不开");
         return;
     };
+    // 单实例锁：并发 collect 会让文件偏移先行推进、INSERT 撞锁被吞 -> 静默丢行
+    let lock_path = data_dir().join("collect.lock");
+    if let Ok(md) = fs::metadata(&lock_path) {
+        let stale = md.modified().ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|e| e.as_secs() > 1800).unwrap_or(false);
+        if stale { let _ = fs::remove_file(&lock_path); }
+    }
+    let _lock = match fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+        Ok(f) => f,
+        Err(_) => {
+            println!("collect busy: 另一个采集进程在跑，跳过本轮");
+            return;
+        }
+    };
     let token = read_token();
     if token.is_none() {
         log_run(&c, "auth", "error", "找不到 token");
@@ -2857,6 +2956,8 @@ pub fn collect_cli(only: Option<&str>) {
     if kv_get(&c, "sync.peer").is_some() {
         sync_cli();
     }
+    drop(_lock);
+    let _ = fs::remove_file(&lock_path);
 }
 
 /// 维护：清掉 quota_snapshots 里每 5 分钟一条的完整 API 响应（~400KB/行，库膨胀元凶），

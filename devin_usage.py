@@ -98,7 +98,7 @@ def read_token() -> str:
     except OSError:
         pass
     raise RuntimeError(f"找不到 token（{CRED_FILES[0]} 或 {TOKEN_FILE}）")
-
+Mac的记录应该是很多的
 
 def read_org(token=None) -> "str | None":
     for p in CONFIG_FILES:
@@ -1456,7 +1456,20 @@ def collect_codex(c) -> int:
     n_ev = 0
     sess = {}
     turn_model = {}                                # turn_id → model
+    # 老格式（event_msg/token_count.last_token_usage）回填：删偏移全量重扫一次
+    if not c.execute("SELECT value FROM kv WHERE key='codex_tc_v3'").fetchone():
+        c.execute("DELETE FROM kv WHERE key LIKE 'off:codex:%'")
+        c.execute("DELETE FROM usage_events WHERE app='codex' AND event_key LIKE 'codex:tc:%'")
+        c.execute("INSERT OR REPLACE INTO kv VALUES('codex_tc_v3','1')")
     for fp in files:
+        stem = fp.stem
+        # 混合格式文件的分界 ordinal：record 首次出现处起 tc 为双写，跳过
+        recmin_key = f"recmin:codex:{stem}"
+        r = c.execute("SELECT value FROM kv WHERE key=?", (recmin_key,)).fetchone()
+        rec_min = int(r[0]) if r else None
+        cur_sid = None
+        cur_model = None
+        cur_provider = "codex"
         try:
             for e in _read_jsonl_incremental(c, "codex", fp):
                 ts = _iso_ts(e.get("timestamp")) or 0
@@ -1464,6 +1477,8 @@ def collect_codex(c) -> int:
                 t = e.get("type")
                 if t == "session_meta":
                     sid = pay.get("session_id") or pay.get("id") or fp.stem
+                    cur_sid = sid
+                    cur_provider = pay.get("model_provider") or cur_provider
                     s = sess.setdefault(sid, {"model": "?", "n": 0, "t0": ts,
                                               "t1": ts, "cwd": "",
                                               "provider": "codex",
@@ -1473,8 +1488,18 @@ def collect_codex(c) -> int:
                     s["t0"] = min(s["t0"], ts)
                 elif t == "turn_context":
                     if pay.get("turn_id") and pay.get("model"):
+                        cur_model = pay["model"]
                         turn_model[pay["turn_id"]] = pay["model"]
                 elif t == "token_usage_record":
+                    o = e.get("ordinal")
+                    if o is not None and (rec_min is None or o < rec_min):
+                        rec_min = o
+                        c.execute("INSERT OR REPLACE INTO kv VALUES(?,?)",
+                                  (recmin_key, str(o)))
+                        c.execute("""DELETE FROM usage_events
+                                     WHERE event_key LIKE ? AND event_key >= ?""",
+                                  (f"codex:tc:{stem}:%",
+                                   f"codex:tc:{stem}:{o:010d}"))
                     rid = pay.get("response_id")
                     if not rid:
                         continue
@@ -1508,6 +1533,42 @@ def collect_codex(c) -> int:
                     s["t0"] = min(s["t0"], ts); s["t1"] = max(s["t1"], ts)
                     s["ti"] += i_; s["to"] += o_; s["tcr"] += cr; s["tcw"] += cw
                 elif t == "event_msg" and pay.get("type") == "token_count":
+                    # 老格式用量：info.last_token_usage 为每轮增量；
+                    # 分界 ordinal 后与 token_usage_record 双写，跳过防双计
+                    ord_ = e.get("ordinal") or ts
+                    if rec_min is None or ord_ < rec_min:
+                        lu = (pay.get("info") or {}).get("last_token_usage") or {}
+                        inp = lu.get("input_tokens") or 0
+                        cr = lu.get("cached_input_tokens") or 0
+                        cw = lu.get("cache_write_input_tokens") or 0
+                        o = lu.get("output_tokens") or 0
+                        if inp + cr + cw + o > 0:
+                            i_ = max(0, inp - cr - cw)
+                            sid = cur_sid or stem
+                            model = cur_model or "?"
+                            day = (datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                                   if ts else "1970-01-01")
+                            cur = c.execute("""INSERT OR IGNORE INTO usage_events
+                                (app,event_key,ts,day,model,kind,session_id,
+                                 tok_in,tok_out,tok_cache_read,tok_cache_write,cost_usd,meta)
+                                VALUES('codex',?,?,?,?,?,?,?,?,?,?,NULL,?)""",
+                                (f"codex:tc:{stem}:{ord_:010d}", ts, day, model,
+                                 cur_provider, f"codex:{sid}", i_, o, cr, cw,
+                                 json.dumps({"reasoning":
+                                             lu.get("reasoning_output_tokens"),
+                                             "fmt": "token_count",
+                                             "provider": cur_provider})))
+                            n_ev += cur.rowcount
+                            s = sess.setdefault(sid, {"model": "?", "n": 0,
+                                                      "t0": ts, "t1": ts,
+                                                      "cwd": "", "provider": "codex",
+                                                      "ti": 0, "to": 0,
+                                                      "tcr": 0, "tcw": 0})
+                            s["n"] += 1
+                            s["model"] = model if model != "?" else s["model"]
+                            s["t0"] = min(s["t0"], ts); s["t1"] = max(s["t1"], ts)
+                            s["ti"] += i_; s["to"] += o
+                            s["tcr"] += cr; s["tcw"] += cw
                     rl = pay.get("rate_limits") or {}
                     for lk in ("primary", "secondary"):
                         w = rl.get(lk) or {}
@@ -1522,7 +1583,7 @@ def collect_codex(c) -> int:
                                          "limit_id": rl.get("limit_id")}),
                              device()))
         except Exception:
-            continue
+            pass
     now = int(time.time())
     n_sess = 0
     for sid, s in sess.items():
