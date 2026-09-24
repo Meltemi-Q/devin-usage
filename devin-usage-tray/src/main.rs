@@ -613,14 +613,15 @@ fn load_app_stats(
     } else {
         a.models.iter().map(|m| m.usd_7d).sum()
     };
-    // 配额快照：取每设备最新一批（多设备汇总时 label 带 @设备 后缀）。
-    // 相关子查询 max(ts) 是 O(N²)（app_quota 8万行时面板直接冻死）——
-    // 改成 GROUP BY 连接，单遍扫出每设备最新 ts。
+    // 配额快照：账号级数据——同账号多设备消耗同一池子，同 label 只留最新一条
+    // （ts 大的赢 = 最新读数）。相关子查询 max(ts) 是 O(N²)，用 GROUP BY 连接。
     if let Ok(mut s) = conn.prepare(
         "SELECT q.label, q.pct_remaining, q.resets_at, q.used, q.lim, q.device
          FROM app_quota q
-         JOIN (SELECT device, max(ts) mts FROM app_quota WHERE app=?1 GROUP BY device) m
-           ON m.device = q.device AND q.ts = m.mts
+         JOIN (SELECT label, max(ts) mts FROM app_quota
+                WHERE app=?1 AND (?2 IS NULL OR device=?2)
+                GROUP BY label) m
+           ON m.label = q.label AND q.ts = m.mts
          WHERE q.app=?1 AND (?2 IS NULL OR q.device=?2)
          ORDER BY CASE q.label WHEN 'plan' THEN 0 WHEN '_plan' THEN 1
                                WHEN 'auto' THEN 2 WHEN 'api' THEN 3
@@ -640,21 +641,9 @@ fn load_app_stats(
             // 共享配额，按基名合并——取最紧剩余% + 最早重置时间
             let rows: Vec<(String, f64, Option<i64>, Option<f64>, Option<f64>, String)> =
                 rows.flatten().collect();
-            let multi_dev = device.is_none()
-                && rows
-                    .iter()
-                    .map(|r| r.5.as_str())
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    > 1;
             let mut grouped: Vec<(String, f64, Option<i64>, Option<f64>, Option<f64>)> =
                 Vec::new();
-            for (label, pct, resets, used, lim, dev) in rows {
-                let label = if multi_dev {
-                    format!("{label}@{dev}")
-                } else {
-                    label
-                };
+            for (label, pct, resets, used, lim, _dev) in rows {
                 let base = if label.ends_with(')') {
                     label
                         .rfind('(')
