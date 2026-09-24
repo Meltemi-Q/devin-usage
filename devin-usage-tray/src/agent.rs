@@ -62,12 +62,9 @@ fn db_path() -> PathBuf {
     data_dir().join("usage.db")
 }
 
-pub fn device() -> String {
-    if let Ok(d) = env::var("USAGE_DEVICE") {
-        if !d.is_empty() {
-            return d;
-        }
-    }
+/// 纯探测：env → hostname 命令。macOS 的 hostname 会被 DHCP/mDNS 改
+/// （MacBookPro.lan→meltemi-2.local 漂移已实测发生），所以不能当稳定身份用。
+fn detect_device() -> String {
     for k in ["COMPUTERNAME", "HOSTNAME"] {
         if let Ok(d) = env::var(k) {
             if !d.is_empty() {
@@ -81,6 +78,46 @@ pub fn device() -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".into())
+}
+
+/// 稳定设备名：USAGE_DEVICE env > kv device.name（首采时写入固定）> 探测值。
+/// kv 被锁时退回探测值但不缓存——下轮再试，避免把漂移中的 hostname 固化。
+pub fn device() -> String {
+    if let Ok(d) = env::var("USAGE_DEVICE") {
+        if !d.is_empty() {
+            return d;
+        }
+    }
+    static DEV: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(d) = DEV.get() {
+        return d.clone();
+    }
+    if let Ok(c) = Connection::open(db_path()) {
+        match c
+            .query_row(
+                "SELECT value FROM kv WHERE key='device.name'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        {
+            Ok(Some(n)) if !n.is_empty() => {
+                let _ = DEV.set(n.clone());
+                return n;
+            }
+            Ok(_) => {
+                let n = detect_device();
+                let _ = c.execute(
+                    "INSERT OR IGNORE INTO kv VALUES('device.name', ?1)",
+                    params![n],
+                );
+                let _ = DEV.set(n.clone());
+                return n;
+            }
+            Err(_) => return detect_device(),
+        }
+    }
+    detect_device()
 }
 
 // Devin CLI/App 目录
@@ -373,6 +410,9 @@ CREATE INDEX IF NOT EXISTS idx_local_created ON local_sessions(created_at);
 CREATE INDEX IF NOT EXISTS idx_cloud_created ON cloud_sessions(created_at);
 CREATE INDEX IF NOT EXISTS idx_events_day ON usage_events(day);
 CREATE INDEX IF NOT EXISTS idx_events_model ON usage_events(app, model);
+CREATE INDEX IF NOT EXISTS idx_events_app_ts ON usage_events(app, ts);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON usage_events(ts);
+CREATE INDEX IF NOT EXISTS idx_quota_app_ts ON app_quota(app, ts);
 "#;
 
 pub fn open_db() -> Option<Connection> {
@@ -2605,8 +2645,15 @@ pub fn sync_cli() {
         let _ = w.flush();
     }
     if !buf.is_empty() {
+        // 加连接/存活超时：对端失联时最长 ~55s 退出，不能无限挂着占库
         if let Ok(mut ch) = Command::new("ssh")
-            .args([&peer, &remote_cmd("import")])
+            .args([
+                "-o", "ConnectTimeout=10",
+                "-o", "ServerAliveInterval=15",
+                "-o", "ServerAliveCountMax=3",
+                &peer,
+                &remote_cmd("import"),
+            ])
             .stdin(std::process::Stdio::piped())
             .spawn()
         {
@@ -2640,7 +2687,13 @@ pub fn sync_cli() {
         format!("export --for {me} --since {since_arg}")
     };
     if let Ok(o) = Command::new("ssh")
-        .args([&peer, &remote_cmd(&sub)])
+        .args([
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            &peer,
+            &remote_cmd(&sub),
+        ])
         .output()
     {
         let txt = String::from_utf8_lossy(&o.stdout);
