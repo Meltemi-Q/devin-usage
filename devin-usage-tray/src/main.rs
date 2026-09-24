@@ -243,6 +243,9 @@ pub fn load_stats(device: Option<&str>) -> Stats {
     st.has_db = true;
     let n = now();
     let t7 = n - 7 * 86400;
+    let dbg_t = std::time::Instant::now();
+    macro_rules! mark { ($s:expr) => { eprintln!("[load_stats {:?}] {}", dbg_t.elapsed(), $s) } }
+    mark!("open");
 
     // 设备清单（同步过的库会带多个）
     if let Ok(mut s) = conn.prepare(
@@ -255,6 +258,7 @@ pub fn load_stats(device: Option<&str>) -> Stats {
             st.devices = rows.flatten().collect();
         }
     }
+    mark!("devices");
 
     st.quota = conn
         .query_row(
@@ -297,6 +301,7 @@ pub fn load_stats(device: Option<&str>) -> Stats {
                        sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
                        FROM local_sessions";
 
+    mark!("quota+collect_runs");
     st.swe2_all = conn
         .query_row(
             &format!("{SEL} WHERE model LIKE 'swe-2%' AND (?1 IS NULL OR device=?1)"),
@@ -329,6 +334,7 @@ pub fn load_stats(device: Option<&str>) -> Stats {
         )
         .unwrap_or_default();
 
+    mark!("swe2+totals");
     // 等效成本：db 里的 model_prices 规则表（首个 prefix 命中）
     let rules = load_prices(&conn);
     st.swe2_usd_7d = cost(&st.swe2_7d, price_of("swe-2", &rules));
@@ -365,6 +371,7 @@ pub fn load_stats(device: Option<&str>) -> Stats {
         }
     }
 
+    mark!("usd loop done");
     const SELM: &str = "SELECT model, count(*), sum(n_user), sum(n_tool_calls),
                         sum(last_activity_at - created_at),
                         sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
@@ -403,6 +410,7 @@ pub fn load_stats(device: Option<&str>) -> Stats {
         }
     }
 
+    mark!("per_model done");
     // 全模型行：面板用（50+ 个 Cascade 内部模型也在里面），按 token 总量排序
     const SELSM: &str = "SELECT source, model, count(*), sum(n_user), sum(n_tool_calls),
                         sum(last_activity_at - created_at),
@@ -433,9 +441,11 @@ pub fn load_stats(device: Option<&str>) -> Stats {
             }
         }
     }
+    mark!("all_models done");
     // 其他应用：独立统计（各应用套餐独立，绝不混入 devin 数字）
     for app in ["cursor", "antigravity", "zcode", "grok", "claude", "codex"] {
         st.apps.insert(app.to_string(), load_app_stats(&conn, app, t7, &rules, device));
+        mark!(app);
     }
     if let Ok(mut stmt) =
         conn.prepare(&format!("{SELSM} WHERE source NOT IN ('cursor','antigravity','zcode','grok','claude','codex') AND created_at>=?1 AND (?2 IS NULL OR device=?2) GROUP BY source, model"))
@@ -459,6 +469,7 @@ pub fn load_stats(device: Option<&str>) -> Stats {
             }
         }
     }
+    mark!("7d fill done");
     st
 }
 
@@ -602,13 +613,15 @@ fn load_app_stats(
     } else {
         a.models.iter().map(|m| m.usd_7d).sum()
     };
-    // 配额快照：取每设备最新一批（多设备汇总时 label 带 @设备 后缀）
+    // 配额快照：取每设备最新一批（多设备汇总时 label 带 @设备 后缀）。
+    // 相关子查询 max(ts) 是 O(N²)（app_quota 8万行时面板直接冻死）——
+    // 改成 GROUP BY 连接，单遍扫出每设备最新 ts。
     if let Ok(mut s) = conn.prepare(
         "SELECT q.label, q.pct_remaining, q.resets_at, q.used, q.lim, q.device
          FROM app_quota q
+         JOIN (SELECT device, max(ts) mts FROM app_quota WHERE app=?1 GROUP BY device) m
+           ON m.device = q.device AND q.ts = m.mts
          WHERE q.app=?1 AND (?2 IS NULL OR q.device=?2)
-           AND q.ts = (SELECT max(ts) FROM app_quota
-                       WHERE app=?1 AND device=q.device)
          ORDER BY CASE q.label WHEN 'plan' THEN 0 WHEN '_plan' THEN 1
                                WHEN 'auto' THEN 2 WHEN 'api' THEN 3
                                ELSE 9 END, q.device, q.label",
@@ -1095,6 +1108,28 @@ fn main() {
         }
         Some("compact") => {
             agent::compact_cli(args.iter().any(|a| a == "--vacuum"));
+            return;
+        }
+        #[cfg(feature = "gui")]
+        Some("probe") => {
+            // 无窗口探针：模拟面板后台加载，验证 tab/device/days 过滤是否生效
+            for (tab, dev, days) in [
+                ("devin", None, 14i64),
+                ("devin", Some("MELTEMI-PC"), 14),
+                ("cursor", Some("MELTEMI-PC"), 14),
+                ("cursor", None, 7),
+                ("all", None, 14),
+            ] {
+                let ch = panel::load_charts(days, tab, dev);
+                let last = ch.daily.last().map(|d| (d.ymd.clone(), d.vals.iter().sum::<f64>()));
+                let tot: f64 = ch.daily.iter().map(|d| d.vals.iter().sum::<f64>()).sum();
+                println!("tab={tab:12} dev={dev:?} days={days}: {} 天, 区间总 {:.2}亿, 末日 {:?}", ch.daily.len(), tot / 1e8, last.map(|(y, v)| (y, v / 1e8)));
+            }
+            let st = load_stats(Some("MELTEMI-PC"));
+            println!("stats(win): devices={:?} devin7d={} cursor7d={}", st.devices, st.total_7d.tin + st.total_7d.tout, st.apps.get("cursor").map(|a| a.total_7d.tin + a.total_7d.tout).unwrap_or(0));
+            let t = std::time::Instant::now();
+            let st0 = load_stats(None);
+            println!("stats(all-dev): {:?} devices={:?}", t.elapsed(), st0.devices);
             return;
         }
         _ => {}

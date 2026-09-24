@@ -20,6 +20,17 @@ use crate::{
 const RELOAD: Duration = Duration::from_secs(60);
 const COLLECT_DELAY: Duration = Duration::from_secs(8);
 
+/// 面板诊断日志：写 data/panel.log（排查"切换不换数据"类问题用）
+fn dbg_log(msg: &str) {
+    if let Some(dir) = crate::project_dir() {
+        let p = dir.join("data").join("panel.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            use std::io::Write;
+            let _ = writeln!(f, "{} {}", crate::now(), msg);
+        }
+    }
+}
+
 // 配色
 const GREEN: egui::Color32 = egui::Color32::from_rgb(52, 199, 89);
 const AMBER: egui::Color32 = egui::Color32::from_rgb(255, 190, 90);
@@ -30,10 +41,12 @@ const C_CR: egui::Color32 = egui::Color32::from_rgb(246, 189, 22);
 const C_CW: egui::Color32 = egui::Color32::from_rgb(114, 98, 253);
 
 pub fn run() -> eframe::Result<()> {
+    dbg_log("panel::run enter");
     // 先读一次数据：窗口图标要用真实配额决定状态点颜色（与托盘一致）
     let st0 = load_stats(None);
-    let pct = st0.quota.as_ref().map(|q| q.weekly_pct);
-    let px = paint_icon(pct, 64);
+    dbg_log(&format!("panel::run st0: devices={:?} apps={:?}", st0.devices, st0.apps.keys().collect::<Vec<_>>()));
+    let px = paint_icon(st0.quota.as_ref().map(|q| q.weekly_pct), 64);
+    dbg_log("paint_icon done");
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("AI 用量")
@@ -46,11 +59,14 @@ pub fn run() -> eframe::Result<()> {
             })),
         ..Default::default()
     };
+    dbg_log("run_native starting");
     eframe::run_native(
         "AI 用量",
         opts,
         Box::new(|cc| {
+            dbg_log("app_creator called");
             load_cjk_font(&cc.egui_ctx);
+            dbg_log("font loaded");
             Ok(Box::new(Panel::new(st0)))
         }),
     )
@@ -105,20 +121,20 @@ fn family_of(m: &str) -> String {
 
 // ---------------------------------------------------------------- 图表数据
 
-struct DayRow {
-    ymd: String,   // 2026-09-17（查明细用）
-    label: String, // 09-17（轴标签用）
-    vals: [f64; 4], // [in, out, cr, cw]
+pub struct DayRow {
+    pub ymd: String,   // 2026-09-17（查明细用）
+    pub label: String, // 09-17（轴标签用）
+    pub vals: [f64; 4], // [in, out, cr, cw]
 }
 
 #[derive(Default)]
-struct Charts {
-    daily: Vec<DayRow>,
+pub struct Charts {
+    pub daily: Vec<DayRow>,
 }
 
 /// days=0 → 全部历史；app="devin" 走 local_sessions，其他应用走 usage_events；
 /// device=Some → 只看该设备
-fn load_charts(days: i64, app: &str, device: Option<&str>) -> Charts {
+pub fn load_charts(days: i64, app: &str, device: Option<&str>) -> Charts {
     let mut c = Charts::default();
     let Some(conn) = open_db() else { return c };
     let t0 = if days > 0 { now() - days * 86400 } else { 0 };
@@ -946,6 +962,9 @@ impl Panel {
 
 impl eframe::App for Panel {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.models.is_empty() && self.charts.daily.is_empty() && self.pending.is_none() && self.loaded_key.2 == -1 {
+            dbg_log(&format!("first update: tab={} dev={:?}", self.tab, self.device));
+        }
         // 收后台刷新结果（SQL 全在工作线程跑，UI 永不阻塞）
         if let Some(rx) = &self.pending {
             match rx.try_recv() {
@@ -958,6 +977,12 @@ impl eframe::App for Panel {
                     self.reloaded = Instant::now();
                     self.collecting = None;
                     self.pending = None;
+                    dbg_log(&format!(
+                        "applied: daily={} detail={:?} cur_tab={} cur_dev={:?}",
+                        self.charts.daily.len(),
+                        self.detail.as_ref().map(|d| d.0.clone()),
+                        self.tab, self.device
+                    ));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending = None,
@@ -983,6 +1008,7 @@ impl eframe::App for Panel {
             let (tx, rx) = std::sync::mpsc::channel();
             self.pending = Some(rx);
             let (tab, dev, days, sel) = (key.0, key.1, key.2, key.3);
+            dbg_log(&format!("reload spawn: tab={tab} dev={dev:?} days={days} sel={sel:?}"));
             let ctx2 = ctx.clone();
             std::thread::spawn(move || {
                 let st = load_stats(dev.as_deref());
@@ -992,6 +1018,13 @@ impl eframe::App for Panel {
                     let (n, rows) = load_day_detail(y, tab, dev.as_deref());
                     (y.to_string(), n, rows)
                 });
+                dbg_log(&format!(
+                    "reload done: tab={tab} dev={dev:?} days={days} sel={sel:?} -> daily={} 首末={:?}/{:?} models={}",
+                    ch.daily.len(),
+                    ch.daily.first().map(|d| d.ymd.clone()),
+                    ch.daily.last().map(|d| (d.ymd.clone(), d.vals.iter().sum::<f64>() as i64)),
+                    ms.len()
+                ));
                 let _ = tx.send((st, ch, ms, dt));
                 ctx2.request_repaint();
             });

@@ -413,6 +413,7 @@ CREATE INDEX IF NOT EXISTS idx_events_model ON usage_events(app, model);
 CREATE INDEX IF NOT EXISTS idx_events_app_ts ON usage_events(app, ts);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON usage_events(ts);
 CREATE INDEX IF NOT EXISTS idx_quota_app_ts ON app_quota(app, ts);
+CREATE INDEX IF NOT EXISTS idx_quota_app_dev_ts ON app_quota(app, device, ts);
 "#;
 
 pub fn open_db() -> Option<Connection> {
