@@ -64,8 +64,12 @@
 - 会话：`state.vscdb` 只读 `composerHeaders` + `cursorDiskKV`
   （不逐条读 bubble——库太大）
 - 日行：`ItemTable` 的 `aiCodeTracking.dailyStats.*`（tab 建议/采纳行数）
-- 配额：`GET cursor.com/api/usage-summary` → used/limit/remaining +
-  auto/api 分列 + `billingCycleEnd` 重置日
+- 配额：`GET cursor.com/api/usage-summary` → `individualUsage.plan`：
+  `used/limit`（included 额度，美分级）+ `totalPercentUsed`（仪表盘口径
+  百分比）+ `autoPercentUsed`/`apiPercentUsed`（Auto 路由 vs API 价
+  请求的成分占比）+ `billingCycleEnd` 重置日。`onDemand` 未启用为 null
+- **配额是账号级数据**：多设备同账号时面板按 label 取最新 ts 合并成一行
+  （两头消耗同一池，重复显示没意义）。所有 app 的配额行都按此口径归并
 
 ## Antigravity（Google IDE）
 
