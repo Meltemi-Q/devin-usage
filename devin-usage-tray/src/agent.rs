@@ -2405,6 +2405,111 @@ fn collect_codex(c: &Connection) -> i64 {
     n_sess
 }
 
+/// ~/.codex/sqlite/state_*.sqlite 的 threads.tokens_used 是 Codex 自己的账本。
+/// rollout jsonl 被清理的会话只在这里留有账：对 rollout 已不存在、且库里
+/// 没有该 thread 事件的行补一条 usage_event（tokens_used 只有总量，记入 tok_in）。
+fn collect_codex_state(c: &Connection) -> i64 {
+    let dir = home().join(".codex").join("sqlite");
+    let mut dbs: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            if name.starts_with("state_") && name.ends_with(".sqlite") {
+                dbs.push(p);
+            }
+        }
+    }
+    if dbs.is_empty() {
+        return 0;
+    }
+    let mut n_ev = 0i64;
+    for db in dbs {
+        // state 库是 WAL 且可能被 Codex 占用：连同 -wal/-shm 拷到临时目录再开
+        let tag = db.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let tmp = std::env::temp_dir().join(format!("du-{tag}.sqlite"));
+        if fs::copy(&db, &tmp).is_err() { continue; }
+        for suf in ["-wal", "-shm"] {
+            let src = PathBuf::from(format!("{}{}", db.display(), suf));
+            if src.exists() {
+                let _ = fs::copy(&src, PathBuf::from(format!("{}{}", tmp.display(), suf)));
+            }
+        }
+        let rows: Vec<(String, Option<String>, i64, i64, i64, String, String)> =
+            match Connection::open(&tmp) {
+                Ok(sc) => sc
+                    .prepare("SELECT id,rollout_path,tokens_used,created_at,updated_at,cwd,title FROM threads WHERE tokens_used>0")
+                    .and_then(|mut st| {
+                        st.query_map([], |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, Option<String>>(1)?,
+                                r.get::<_, i64>(2)?,
+                                r.get::<_, i64>(3)?,
+                                r.get::<_, i64>(4)?,
+                                r.get::<_, String>(5).unwrap_or_default(),
+                                r.get::<_, String>(6).unwrap_or_default(),
+                            ))
+                        })
+                        .and_then(|it| it.collect::<Result<Vec<_>, _>>())
+                    })
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = fs::remove_file(format!("{}-shm", tmp.display()));
+        for (tid, rollout, tok, created, updated, cwd, title) in rows {
+            // rollout 还在 -> jsonl 采集器覆盖；库里已有该 thread 事件 -> 防双计
+            if rollout.as_deref().map(|p| Path::new(p).exists()).unwrap_or(false) {
+                continue;
+            }
+            let sid = format!("codex:{tid}");
+            let dup: bool = c
+                .query_row(
+                    "SELECT 1 FROM usage_events WHERE app='codex' AND session_id=? LIMIT 1",
+                    [&sid],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if dup {
+                continue;
+            }
+            let ts = if updated > 0 { updated } else { created };
+            let meta = json!({"src": "state_ledger", "approx_total": true, "title": title});
+            let rc = c.execute(
+                "INSERT OR IGNORE INTO usage_events
+                 (app,event_key,ts,day,model,kind,session_id,
+                  tok_in,tok_out,tok_cache_read,tok_cache_write,cost_usd,meta,device)
+                 VALUES('codex',?,?,?,'?','ledger',?, ?,0,0,0,NULL,?,?)",
+                params![
+                    format!("codex:state:{tid}"), ts, day_of(ts), sid,
+                    tok, meta.to_string(), device()
+                ],
+            ).unwrap_or_else(|e| {
+                eprintln!("codex state insert 失败 {tid}: {e}");
+                0
+            });
+            if rc > 0 {
+                n_ev += 1;
+                let _ = c.execute(
+                    "INSERT INTO local_sessions
+                     (session_id,source,model,title,cwd,created_at,last_activity_at,
+                      n_user,n_assistant,n_tool,n_system,n_tool_calls,n_prompts,
+                      tok_in,tok_out,tok_cache_read,tok_cache_write,first_seen,last_seen)
+                     VALUES (?,'codex','?',?,?,?,?, 0,1,0,0,0,0, ?,0,0,0, ?,?)
+                     ON CONFLICT(session_id) DO NOTHING",
+                    params![sid, title, cwd, created, ts, tok, now_s(), now_s()],
+                );
+            }
+        }
+    }
+    if n_ev > 0 {
+        log_run(c, "codex-state", "ok", &format!("+{n_ev} ledger events"));
+    }
+    n_ev
+}
+
 // ---------------------------------------------------------------- 价格表
 
 const BUILTIN_PRICES: &[(&str, f64, f64, f64, f64, &str)] = &[
@@ -2976,6 +3081,7 @@ pub fn collect_cli(only: Option<&str>) {
         ("grok", collect_grok),
         ("claude", collect_claude),
         ("codex", collect_codex),
+        ("codex-state", collect_codex_state),
     ] {
         run(name, f, &mut results);
     }
