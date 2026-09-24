@@ -1697,6 +1697,30 @@ fn read_jsonl_incremental(c: &Connection, app: &str, path: &Path) -> Vec<Value> 
         .collect()
 }
 
+/// 源文件被删除/轮转后，off:<app>:<path> 偏移键即成死键——按存活清单清掉。
+fn prune_offsets(c: &Connection, app: &str, live: &[PathBuf]) {
+    if live.is_empty() {
+        return; // 目录暂时不可读时不清，避免误删全部偏移
+    }
+    let live: std::collections::HashSet<String> =
+        live.iter().map(|p| p.display().to_string()).collect();
+    let prefix = format!("off:{app}:");
+    let stale: Vec<String> = c
+        .prepare("SELECT key FROM kv WHERE key LIKE ?1")
+        .ok()
+        .and_then(|mut s| {
+            s.query_map([format!("{prefix}%")], |r| r.get::<_, String>(0))
+                .ok()
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    for k in stale {
+        if !live.contains(&k[prefix.len()..]) {
+            let _ = c.execute("DELETE FROM kv WHERE key=?", params![k]);
+        }
+    }
+}
+
 fn collect_zcode(c: &Connection) -> i64 {
     let root = home().join(".zcode/cli/agents");
     let mut files: Vec<PathBuf> = Vec::new();
@@ -1716,6 +1740,7 @@ fn collect_zcode(c: &Connection) -> i64 {
         return 0;
     }
     files.sort();
+    prune_offsets(c, "zcode", &files);
     let mut n_ev = 0i64;
     let mut sess: std::collections::HashMap<String, Value> = Default::default();
     for p in files {
@@ -1918,6 +1943,7 @@ fn collect_grok(c: &Connection) -> i64 {
             }
         }
     }
+    prune_offsets(c, "grok", &upds);
     let mut n_ev = 0i64;
     for upd in upds {
         for e in read_jsonl_incremental(c, "grok", &upd) {
@@ -2037,6 +2063,7 @@ fn collect_claude(c: &Connection) -> i64 {
             }
         }
     }
+    prune_offsets(c, "claude", &files);
     let mut n_ev = 0i64;
     let mut seen = std::collections::HashSet::new();
     let mut sess: std::collections::HashMap<String, Value> = Default::default();
@@ -2157,6 +2184,7 @@ fn collect_codex(c: &Connection) -> i64 {
         return 0;
     }
     files.sort();
+    prune_offsets(c, "codex", &files);
     let mut n_ev = 0i64;
     // turn_id -> model（turn_context 在其响应之前出现）
     let mut turn_model: std::collections::HashMap<String, String> = Default::default();
