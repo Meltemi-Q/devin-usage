@@ -1063,6 +1063,7 @@ fn main() {
             println!("  export [--for <dev>] [--since t=v,..]   NDJSON 增量导出 → stdout");
             println!("  import                    stdin NDJSON → 入库");
             println!("  sync                      与 kv sync.peer 配置的 ssh 对端双向同步");
+            println!("  compact [--vacuum]        清理 quota 原始响应大字段，--vacuum 回收页空间");
             #[cfg(feature = "gui")]
             println!("  （无参数）托盘 | --panel 面板 | --dump-icon 导出图标");
             return;
@@ -1090,6 +1091,10 @@ fn main() {
         }
         Some("sync") => {
             agent::sync_cli();
+            return;
+        }
+        Some("compact") => {
+            agent::compact_cli(args.iter().any(|a| a == "--vacuum"));
             return;
         }
         _ => {}

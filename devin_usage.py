@@ -301,8 +301,8 @@ def collect_quota(c, token):
         c.execute("""INSERT INTO quota_snapshots
             (ts,plan_name,teams_tier,weekly_quota_remaining_pct,
              overage_balance_micros,available_prompt_credits,plan_start,plan_end,
-             daily_reset,weekly_reset,n_models,raw_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+             daily_reset,weekly_reset,n_models,raw_json,device)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?)""",
                   (now, pi.get("planName"), pi.get("teamsTier"),
                    ps.get("weeklyQuotaRemainingPercent"),
                    _int(ps.get("overageBalanceMicros")),
@@ -310,7 +310,9 @@ def collect_quota(c, token):
                    ps.get("planStart"), ps.get("planEnd"),
                    _int(ps.get("dailyQuotaResetAtUnix")),
                    _int(ps.get("weeklyQuotaResetAtUnix")),
-                   len(models), json.dumps(j)))
+                   len(models), device()))
+        c.execute("INSERT INTO kv(k,v) VALUES('quota.devin.raw',?) "
+                  "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (json.dumps(j),))
     for m in models:
         uid = m.get("modelUid")
         if uid:

@@ -588,7 +588,7 @@ fn collect_quota(c: &Connection, token: &str) -> Option<Value> {
         .unwrap_or(0);
     if now - last >= 300 {
         let _ = c.execute(
-            "INSERT INTO quota_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO quota_snapshots (ts,plan_name,teams_tier,weekly_quota_remaining_pct,overage_balance_micros,available_prompt_credits,plan_start,plan_end,daily_reset,weekly_reset,n_models,raw_json,device) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?)",
             params![
                 now,
                 vstr(pi, "planName"),
@@ -601,8 +601,13 @@ fn collect_quota(c: &Connection, token: &str) -> Option<Value> {
                 opt_i64(&ps["dailyQuotaResetAtUnix"]),
                 opt_i64(&ps["weeklyQuotaResetAtUnix"]),
                 models.len() as i64,
-                j.to_string()
+                device()
             ],
+        );
+        // 原始响应只留最新一份在 kv，避免每 5 分钟一条 ~400KB 快照把库撑爆
+        let _ = c.execute(
+            "INSERT INTO kv(k,v) VALUES('quota.devin.raw',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            params![j.to_string()],
         );
     }
     for m in &models {
@@ -2822,5 +2827,31 @@ pub fn collect_cli(only: Option<&str>) {
     // 配了 sync.peer 就自动同步
     if kv_get(&c, "sync.peer").is_some() {
         sync_cli();
+    }
+}
+
+/// 维护：清掉 quota_snapshots 里每 5 分钟一条的完整 API 响应（~400KB/行，库膨胀元凶），
+/// 可选 --vacuum 回收页空间（需独占锁，建议在采集间隔跑）。
+pub fn compact_cli(vacuum: bool) {
+    let Some(c) = open_db() else {
+        eprintln!("db 打不开");
+        return;
+    };
+    let page = |c: &Connection| -> i64 {
+        c.query_row("SELECT page_count*page_size FROM pragma_page_count, pragma_page_size", [], |r| r.get(0)).unwrap_or(0)
+    };
+    let before = page(&c);
+    let n = c
+        .execute("UPDATE quota_snapshots SET raw_json=NULL WHERE raw_json IS NOT NULL", [])
+        .unwrap_or(0);
+    println!("quota_snapshots.raw_json 清空 {n} 行");
+    let _ = c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    if vacuum {
+        match c.execute_batch("VACUUM") {
+            Ok(_) => println!("VACUUM: {:.1}MB -> {:.1}MB", before as f64 / 1048576.0, page(&c) as f64 / 1048576.0),
+            Err(e) => eprintln!("VACUUM 失败（可能被占用，稍后重试）: {e}"),
+        }
+    } else {
+        println!("当前库 {:.1}MB；加 --vacuum 可回收页空间", before as f64 / 1048576.0);
     }
 }
