@@ -1038,6 +1038,11 @@ impl eframe::App for Panel {
                     ui.image((t.id(), egui::vec2(22.0, 22.0)));
                 }
                 ui.heading("AI 用量");
+                ui.label(
+                    egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION"), "+", env!("GIT_HASH")))
+                        .weak()
+                        .small(),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(format!("采集于 {}", self.st.last_collect_ago))

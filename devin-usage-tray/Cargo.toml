@@ -1,7 +1,8 @@
 [package]
 name = "devin-usage-tray"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+build = "build.rs"
 
 # 默认带 GUI（托盘+面板）；VPS/headless 构建用 --no-default-features 得到纯采集器
 [features]

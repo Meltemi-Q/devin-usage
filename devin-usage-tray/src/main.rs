@@ -1045,10 +1045,26 @@ impl ApplicationHandler for App {
     }
 }
 
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("GIT_HASH"));
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // 采集器/同步子命令——不依赖 GUI，VPS 可 --no-default-features 编译后直接用
     match args.get(1).map(|s| s.as_str()) {
+        Some("--version") | Some("-V") | Some("version") => {
+            println!("devin-usage-tray {VERSION}");
+            return;
+        }
+        Some("--help") | Some("-h") | Some("help") => {
+            println!("devin-usage-tray {VERSION}");
+            println!("  collect [--only <name>]   采集一轮（quota/cloud/local/cursor/antigravity/zcode/grok/claude/codex）");
+            println!("  export [--for <dev>] [--since t=v,..]   NDJSON 增量导出 → stdout");
+            println!("  import                    stdin NDJSON → 入库");
+            println!("  sync                      与 kv sync.peer 配置的 ssh 对端双向同步");
+            #[cfg(feature = "gui")]
+            println!("  （无参数）托盘 | --panel 面板 | --dump-icon 导出图标");
+            return;
+        }
         Some("collect") => {
             let only = args
                 .windows(2)
@@ -1113,6 +1129,6 @@ fn main() {
 
     #[cfg(not(feature = "gui"))]
     {
-        eprintln!("devin-usage-agent：collect [--only <n>] | export [--for <dev>] | import | sync");
+        eprintln!("devin-usage-tray {VERSION} — collect [--only <n>] | export [--for <dev>] | import | sync");
     }
 }

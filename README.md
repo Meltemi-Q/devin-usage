@@ -197,7 +197,17 @@ ZCode / Grok / Claude / 总览 Tab，各应用套餐/配额/计费完全独立�
 或想要桌面小组件的场景；托盘菜单"打开面板"可直接唤起。
 
 macOS 打 App：`bash bundle-macos.sh` 生成 `~/Applications/DevinUsage.app`
-（含 icns 图标），Dock/Spotlight 可启动，不占菜单栏。
+——自包含包（二进制拷入包内 + icns 图标 + adhoc 签名 + 版本号取自
+Cargo.toml），Dock/Spotlight 可启动，不占菜单栏。
+
+### 版本与部署
+
+`devin-usage-tray --version` 输出 `版本+commit`（如 `0.2.0+c084b6e`），
+用于核对三端二进制是否同源。
+
+`./deploy.sh [mac vps]` 一键远端部署：tar 同步源码 → 远端 cargo 重建 →
+重启托盘（launchd KeepAlive）→ 重打 .app → 回显远端版本。commit hash
+通过 `devin-usage-tray/GIT_HASH` 文件捎带，远端无 .git 也能对版。
 
 依赖：tray-icon + winit + eframe(egui) + rusqlite(bundled) + arboard + image。
 Windows 构建需要链接器：`x86_64-pc-windows-gnu` 工具链 + mingw（或 MSVC）。
