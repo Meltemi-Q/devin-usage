@@ -11,7 +11,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use chrono::{DateTime, Local, TimeZone};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------- 常量/路径
@@ -2605,11 +2605,11 @@ pub fn export_cli(for_dev: Option<&str>, since: Option<&str>) {
     let _ = w.flush();
 }
 
-fn import_row(c: &Connection, t: &str, r: &serde_json::Map<String, Value>) {
+fn import_row(c: &Connection, t: &str, r: &serde_json::Map<String, Value>, errs: &mut i64) {
     let g = |k: &str| j2s(r.get(k).unwrap_or(&Value::Null));
     match t {
         "usage_events" => {
-            let _ = c.execute(
+            *errs += c.execute(
                 "INSERT OR IGNORE INTO usage_events
                  (app,event_key,ts,day,model,kind,session_id,tok_in,tok_out,
                   tok_cache_read,tok_cache_write,cost_usd,meta,device)
@@ -2618,19 +2618,19 @@ fn import_row(c: &Connection, t: &str, r: &serde_json::Map<String, Value>) {
                         g("kind"), g("session_id"), g("tok_in"), g("tok_out"),
                         g("tok_cache_read"), g("tok_cache_write"), g("cost_usd"),
                         g("meta"), g("device")],
-            );
+            ).is_err() as i64;
         }
         "app_quota" => {
-            let _ = c.execute(
+            *errs += c.execute(
                 "INSERT OR REPLACE INTO app_quota
                  (app,label,ts,pct_remaining,used,lim,resets_at,meta,device)
                  VALUES (?,?,?,?,?,?,?,?,?)",
                 params![g("app"), g("label"), g("ts"), g("pct_remaining"),
                         g("used"), g("lim"), g("resets_at"), g("meta"), g("device")],
-            );
+            ).is_err() as i64;
         }
         "local_sessions" => {
-            let _ = c.execute(
+            *errs += c.execute(
                 "INSERT INTO local_sessions
                  (session_id,source,model,agent_mode,backend_type,cwd,title,
                   created_at,last_activity_at,credit_cost,acu_cost,
@@ -2654,10 +2654,10 @@ fn import_row(c: &Connection, t: &str, r: &serde_json::Map<String, Value>) {
                         g("n_tool_calls"), g("n_prompts"), g("tok_in"), g("tok_out"),
                         g("tok_cache_read"), g("tok_cache_write"), g("gen_ms"),
                         now_s(), g("last_seen"), g("device")],
-            );
+            ).is_err() as i64;
         }
         "cloud_sessions" => {
-            let _ = c.execute(
+            *errs += c.execute(
                 "INSERT INTO cloud_sessions
                  (session_id,title,status,status_detail,origin,category,user_id,
                   created_at,updated_at,acus_consumed,n_prs,first_seen,last_seen,device)
@@ -2671,10 +2671,10 @@ fn import_row(c: &Connection, t: &str, r: &serde_json::Map<String, Value>) {
                         g("origin"), g("category"), g("user_id"), g("created_at"),
                         g("updated_at"), g("acus_consumed"), g("n_prs"),
                         now_s(), g("last_seen"), g("device")],
-            );
+            ).is_err() as i64;
         }
         "quota_snapshots" => {
-            let _ = c.execute(
+            *errs += c.execute(
                 "INSERT OR REPLACE INTO quota_snapshots
                  (ts,plan_name,teams_tier,weekly_quota_remaining_pct,
                   overage_balance_micros,available_prompt_credits,plan_start,plan_end,
@@ -2684,49 +2684,70 @@ fn import_row(c: &Connection, t: &str, r: &serde_json::Map<String, Value>) {
                         g("weekly_quota_remaining_pct"), g("overage_balance_micros"),
                         g("available_prompt_credits"), g("plan_start"), g("plan_end"),
                         g("daily_reset"), g("weekly_reset"), g("n_models"), g("device")],
-            );
+            ).is_err() as i64;
         }
         "daily_activity" => {
-            let _ = c.execute(
+            *errs += c.execute(
                 "INSERT OR REPLACE INTO daily_activity (app,day,metric,value,device) VALUES (?,?,?,?,?)",
                 params![g("app"), g("day"), g("metric"), g("value"), g("device")],
-            );
+            ).is_err() as i64;
         }
         "model_multipliers" => {
-            let _ = c.execute(
+            *errs += c.execute(
                 "INSERT OR REPLACE INTO model_multipliers VALUES (?,?,?,?)",
                 params![g("model_uid"), g("label"), g("credit_multiplier"), g("updated_at")],
-            );
+            ).is_err() as i64;
         }
         _ => {}
     }
 }
 
 /// `import`：stdin NDJSON → 本库（单事务，4 万行也秒级）。
+/// 导入用事务：BEGIN DEFERRED 本身不占锁基本不会失败；
+/// 真失败必须非零退出——否则发送方提交水位、丢掉的行永远不会重传。
+fn begin_tx(c: &mut Connection) -> Transaction<'_> {
+    match c.transaction() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("import: begin tx 失败: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn commit_tx(tx: Transaction<'_>) {
+    if tx.commit().is_err() {
+        eprintln!("import: commit 失败");
+        std::process::exit(2);
+    }
+}
+
 pub fn import_cli() {
     let Some(mut c) = open_db() else { return };
+    let _ = c.execute_batch("PRAGMA busy_timeout=30000;");
     let stdin = std::io::stdin();
     let mut n = 0i64;
     let mut buf = String::new();
     if stdin.lock().read_to_string(&mut buf).is_err() {
         return;
     }
-    let mut tx = match c.transaction() {
-        Ok(t) => t,
-        Err(_) => return,
-    };
+    let mut tx = begin_tx(&mut c);
+    let mut errs = 0i64;
     for line in buf.lines() {
         let Ok(e) = serde_json::from_str::<Value>(line) else { continue };
         let (Some(t), Some(r)) = (vstr(&e, "t"), e["r"].as_object()) else { continue };
-        import_row(&tx, &t, r);
+        import_row(&tx, &t, r, &mut errs);
         n += 1;
         if n % 2000 == 0 {
-            let _ = tx.commit();
-            let Ok(ntx) = c.transaction() else { return };
-            tx = ntx;
+            commit_tx(tx);
+            tx = begin_tx(&mut c);
         }
     }
-    let _ = tx.commit();
+    commit_tx(tx);
+    if errs > 0 {
+        eprintln!("import: {n} rows, {errs} 行失败 —— 水位不提交，下轮重传");
+        std::process::exit(2);
+    }
     eprintln!("import: {n} rows");
 }
 
@@ -2734,6 +2755,7 @@ pub fn import_cli() {
 /// 配置：kv sync.peer=vps（ssh别名），sync.remote=远程项目目录。
 pub fn sync_cli() {
     let Some(mut c) = open_db() else { return };
+    let _ = c.execute_batch("PRAGMA busy_timeout=30000;");
     let Some(peer) = kv_get(&c, "sync.peer") else {
         eprintln!("sync: 未配置 sync.peer");
         return;
@@ -2827,17 +2849,15 @@ pub fn sync_cli() {
     {
         let txt = String::from_utf8_lossy(&o.stdout);
         let mut n = 0;
+        let mut errs = 0i64;
         let mut max_wm: std::collections::HashMap<String, i64> = Default::default();
         // 分批提交：单个大事务会长时间占写锁，冻住面板/托盘的读查询
         {
-            let mut tx = match c.transaction() {
-                Ok(t) => t,
-                Err(_) => return,
-            };
+            let mut tx = begin_tx(&mut c);
             for line in txt.lines() {
                 if let Ok(e) = serde_json::from_str::<Value>(line) {
                     if let (Some(t), Some(r)) = (vstr(&e, "t"), e["r"].as_object()) {
-                        import_row(&tx, &t, r);
+                        import_row(&tx, &t, r, &mut errs);
                         // 行里的水位字段：rowid 表取 rowid，会话表取 last_seen
                         let wm_v = r.get("rowid").or_else(|| r.get("last_seen"))
                             .and_then(opt_i64);
@@ -2847,14 +2867,18 @@ pub fn sync_cli() {
                         }
                         n += 1;
                         if n % 2000 == 0 {
-                            let _ = tx.commit();
-                            let Ok(ntx) = c.transaction() else { return };
-                            tx = ntx;
+                            commit_tx(tx);
+                            tx = begin_tx(&mut c);
                         }
                     }
                 }
             }
-            let _ = tx.commit();
+            commit_tx(tx);
+        }
+        if errs > 0 {
+            // 有失败行：不推进 have: 水位，下轮重传补齐
+            eprintln!("sync <- {peer}: {n} rows, {errs} 行失败，水位不推进");
+            return;
         }
         for (t, m) in max_wm {
             let cur: i64 = kv_get(&c, &format!("have:{peer}:{t}"))
