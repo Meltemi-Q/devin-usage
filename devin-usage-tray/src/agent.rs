@@ -2079,6 +2079,171 @@ fn collect_claude(c: &Connection) -> i64 {
     n_sess
 }
 
+// ---- codex（Codex CLI + Codex Desktop：同写 ~/.codex/sessions/rollout-*.jsonl）
+fn collect_codex(c: &Connection) -> i64 {
+    let root = home().join(".codex");
+    let mut files: Vec<PathBuf> = Vec::new();
+    // sessions/YYYY/MM/DD/rollout-*.jsonl（递归）+ archived_sessions/*.jsonl
+    let mut stack = vec![root.join("sessions")];
+    while let Some(d) = stack.pop() {
+        if let Ok(rd) = fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().map(|x| x == "jsonl").unwrap_or(false) {
+                    files.push(p);
+                }
+            }
+        }
+    }
+    if let Ok(rd) = fs::read_dir(root.join("archived_sessions")) {
+        files.extend(
+            rd.flatten()
+                .map(|x| x.path())
+                .filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false)),
+        );
+    }
+    if files.is_empty() {
+        log_run(c, "codex", "skip", "~/.codex/sessions 不存在");
+        return 0;
+    }
+    files.sort();
+    let mut n_ev = 0i64;
+    // turn_id -> model（turn_context 在其响应之前出现）
+    let mut turn_model: std::collections::HashMap<String, String> = Default::default();
+    let mut sess: std::collections::HashMap<String, Value> = Default::default();
+    for fp in files {
+        for e in read_jsonl_incremental(c, "codex", &fp) {
+            let ts = iso_ts(&e["timestamp"]).unwrap_or(0);
+            let pay = &e["payload"];
+            match vstr(&e, "type").as_deref() {
+                Some("session_meta") => {
+                    let sid = vstr(pay, "session_id").or_else(|| vstr(pay, "id"))
+                        .unwrap_or_else(|| fp.file_stem().unwrap_or_default()
+                            .to_string_lossy().into());
+                    let s = sess.entry(sid).or_insert(json!({
+                        "model": "?", "n": 0, "t0": ts, "t1": ts,
+                        "cwd": "", "provider": "codex",
+                        "ti": 0, "to": 0, "tcr": 0, "tcw": 0
+                    }));
+                    if let Some(cwd) = vstr(pay, "cwd") { s["cwd"] = json!(cwd); }
+                    if let Some(p) = vstr(pay, "model_provider") { s["provider"] = json!(p); }
+                    s["t0"] = json!(opt_i64(&s["t0"]).unwrap_or(ts).min(ts));
+                }
+                Some("turn_context") => {
+                    if let (Some(tid), Some(m)) =
+                        (vstr(pay, "turn_id"), vstr(pay, "model"))
+                    {
+                        turn_model.insert(tid, m);
+                    }
+                }
+                Some("token_usage_record") => {
+                    let rid = vstr(pay, "response_id");
+                    let Some(rid) = rid else { continue };
+                    let sid = vstr(pay, "session_id").or_else(|| vstr(pay, "thread_id"))
+                        .unwrap_or_else(|| fp.file_stem().unwrap_or_default()
+                            .to_string_lossy().into());
+                    let tid = vstr(pay, "turn_id").unwrap_or_default();
+                    let model = turn_model.get(&tid).cloned().unwrap_or_else(|| "?".into());
+                    let u = &pay["usage"];
+                    // OpenAI 惯例：input_tokens 含 cached + cache_write，扣掉避免双计
+                    let inp = opt_i64(&u["input_tokens"]).unwrap_or(0);
+                    let cr = opt_i64(&u["cached_input_tokens"]).unwrap_or(0);
+                    let cw = opt_i64(&u["cache_write_input_tokens"]).unwrap_or(0);
+                    let i_ = (inp - cr - cw).max(0);
+                    let o_ = opt_i64(&u["output_tokens"]).unwrap_or(0);
+                    let provider = sess.get(&sid)
+                        .and_then(|s| vstr(s, "provider"))
+                        .unwrap_or_else(|| "codex".into());
+                    let meta = json!({
+                        "reasoning": u["reasoning_output_tokens"],
+                        "turn": tid, "provider": provider,
+                    });
+                    let rc = c.execute(
+                        "INSERT OR IGNORE INTO usage_events
+                         (app,event_key,ts,day,model,kind,session_id,
+                          tok_in,tok_out,tok_cache_read,tok_cache_write,cost_usd,meta,device)
+                         VALUES('codex',?,?,?,?,?,?,?,?,?,?,NULL,?,?)",
+                        params![
+                            format!("codex:{rid}"), ts, day_of(ts), model, provider,
+                            format!("codex:{sid}"), i_, o_, cr, cw,
+                            meta.to_string(), device()
+                        ],
+                    ).unwrap_or(0);
+                    n_ev += rc as i64;
+                    let s = sess.entry(sid.clone()).or_insert(json!({
+                        "model": "?", "n": 0, "t0": ts, "t1": ts,
+                        "cwd": "", "provider": "codex",
+                        "ti": 0, "to": 0, "tcr": 0, "tcw": 0
+                    }));
+                    s["n"] = json!(opt_i64(&s["n"]).unwrap_or(0) + 1);
+                    if model != "?" { s["model"] = json!(model); }
+                    s["t0"] = json!(opt_i64(&s["t0"]).unwrap_or(ts).min(ts));
+                    s["t1"] = json!(opt_i64(&s["t1"]).unwrap_or(ts).max(ts));
+                    s["ti"] = json!(opt_i64(&s["ti"]).unwrap_or(0) + i_);
+                    s["to"] = json!(opt_i64(&s["to"]).unwrap_or(0) + o_);
+                    s["tcr"] = json!(opt_i64(&s["tcr"]).unwrap_or(0) + cr);
+                    s["tcw"] = json!(opt_i64(&s["tcw"]).unwrap_or(0) + cw);
+                }
+                Some("event_msg") => {
+                    // rate_limits（ChatGPT 直连账号才有；走代理时为 null）
+                    if vstr(pay, "type").as_deref() != Some("token_count") { continue; }
+                    let rl = &pay["rate_limits"];
+                    for lk in ["primary", "secondary"] {
+                        let w = &rl[lk];
+                        let Some(pct) = opt_f64(&w["used_percent"]) else { continue };
+                        let Some(reset) = opt_i64(&w["resets_at"])
+                            .or_else(|| opt_i64(&w["reset_at"]))
+                        else { continue };
+                        let meta = json!({"window_minutes": w["window_minutes"],
+                                          "limit_id": rl["limit_id"]});
+                        let _ = c.execute(
+                            "INSERT OR REPLACE INTO app_quota VALUES('codex',?,?,?,?,?,?,?,?)",
+                            params![lk, ts, (100.0 - pct).max(0.0), pct, 100.0,
+                                    reset, meta.to_string(), device()],
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let now = now_s();
+    let mut n_sess = 0i64;
+    for (sid, s) in &sess {
+        let cwd = vstr(s, "cwd").unwrap_or_default();
+        let title = Path::new(&cwd)
+            .file_name()
+            .map(|x| x.to_string_lossy().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| sid.clone());
+        let _ = c.execute(
+            "INSERT INTO local_sessions
+             (session_id,source,model,title,cwd,created_at,last_activity_at,
+              n_user,n_assistant,n_tool,n_system,n_tool_calls,n_prompts,
+              tok_in,tok_out,tok_cache_read,tok_cache_write,first_seen,last_seen)
+             VALUES (?, 'codex', ?, ?, ?, ?, ?, 0, ?, 0,0,0,0, ?,?,?,?, ?,?)
+             ON CONFLICT(session_id) DO UPDATE SET
+              model=excluded.model, last_activity_at=excluded.last_activity_at,
+              n_assistant=excluded.n_assistant, tok_in=excluded.tok_in,
+              tok_out=excluded.tok_out, tok_cache_read=excluded.tok_cache_read,
+              tok_cache_write=excluded.tok_cache_write, last_seen=excluded.last_seen",
+            params![
+                format!("codex:{sid}"), vstr(s, "model"), title, cwd,
+                opt_i64(&s["t0"]).unwrap_or(0), opt_i64(&s["t1"]).unwrap_or(0),
+                opt_i64(&s["n"]).unwrap_or(0),
+                opt_i64(&s["ti"]).unwrap_or(0), opt_i64(&s["to"]).unwrap_or(0),
+                opt_i64(&s["tcr"]).unwrap_or(0), opt_i64(&s["tcw"]).unwrap_or(0),
+                now, now
+            ],
+        );
+        n_sess += 1;
+    }
+    log_run(c, "codex", "ok", &format!("{n_sess} sessions, +{n_ev} events"));
+    n_sess
+}
+
 // ---------------------------------------------------------------- 价格表
 
 const BUILTIN_PRICES: &[(&str, f64, f64, f64, f64, &str)] = &[
@@ -2569,6 +2734,7 @@ pub fn collect_cli(only: Option<&str>) {
         ("zcode", collect_zcode),
         ("grok", collect_grok),
         ("claude", collect_claude),
+        ("codex", collect_codex),
     ] {
         run(name, f, &mut results);
     }

@@ -522,6 +522,7 @@ impl Panel {
             "zcode" => "ZCode",
             "grok" => "Grok",
             "claude" => "Claude",
+            "codex" => "Codex",
             x => x,
         };
         let Some(ap) = self.st.apps.get(self.tab) else {
@@ -980,6 +981,7 @@ impl eframe::App for Panel {
                             "zcode" => "ZCode",
                             "grok" => "Grok",
                             "claude" => "Claude",
+            "codex" => "Codex",
                             x => x,
                         };
                         let mut s = format!(
@@ -1062,6 +1064,7 @@ impl eframe::App for Panel {
                     ("zcode", "ZCode"),
                     ("grok", "Grok"),
                     ("claude", "Claude"),
+                    ("codex", "Codex"),
                 ] {
                     if ui.selectable_label(self.tab == key, label).clicked()
                         && self.tab != key
@@ -1257,6 +1260,7 @@ impl eframe::App for Panel {
                                 "zcode" => "ZCode",
                                 "grok" => "Grok",
                                 "claude" => "Claude",
+            "codex" => "Codex",
                                 x => x,
                             };
                             if ap.quota_rows.is_empty() {
@@ -1311,6 +1315,7 @@ impl eframe::App for Panel {
                                         "zcode" => "ZCode",
                                         "grok" => "Grok",
                                         "claude" => "Claude",
+            "codex" => "Codex",
                                         x => x,
                                     };
                                     let a = &ap.total_all;

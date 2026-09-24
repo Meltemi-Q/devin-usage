@@ -311,7 +311,7 @@ pub fn load_stats(device: Option<&str>) -> Stats {
         .unwrap_or_default();
     // devin 系总计（排除其他应用——各应用套餐独立，不混计）
     const DEVIN_SRC: &str =
-        "source NOT IN ('cursor','antigravity','zcode','grok','claude')";
+        "source NOT IN ('cursor','antigravity','zcode','grok','claude','codex')";
     st.total_7d = conn
         .query_row(
             &format!("{SEL} WHERE {DEVIN_SRC} AND created_at>=?1 AND (?2 IS NULL OR device=?2)"),
@@ -407,7 +407,7 @@ pub fn load_stats(device: Option<&str>) -> Stats {
                         sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
                         FROM local_sessions";
     if let Ok(mut stmt) = conn.prepare(&format!(
-        "{SELSM} WHERE source NOT IN ('cursor','antigravity','zcode','grok','claude')
+        "{SELSM} WHERE source NOT IN ('cursor','antigravity','zcode','grok','claude','codex')
            AND (?1 IS NULL OR device=?1) GROUP BY source, model
          ORDER BY sum(ifnull(tok_in,0)+ifnull(tok_out,0)+ifnull(tok_cache_read,0)+ifnull(tok_cache_write,0)) DESC
          LIMIT 200"
@@ -432,11 +432,11 @@ pub fn load_stats(device: Option<&str>) -> Stats {
         }
     }
     // 其他应用：独立统计（各应用套餐独立，绝不混入 devin 数字）
-    for app in ["cursor", "antigravity", "zcode", "grok", "claude"] {
+    for app in ["cursor", "antigravity", "zcode", "grok", "claude", "codex"] {
         st.apps.insert(app.to_string(), load_app_stats(&conn, app, t7, &rules, device));
     }
     if let Ok(mut stmt) =
-        conn.prepare(&format!("{SELSM} WHERE source NOT IN ('cursor','antigravity','zcode','grok','claude') AND created_at>=?1 AND (?2 IS NULL OR device=?2) GROUP BY source, model"))
+        conn.prepare(&format!("{SELSM} WHERE source NOT IN ('cursor','antigravity','zcode','grok','claude','codex') AND created_at>=?1 AND (?2 IS NULL OR device=?2) GROUP BY source, model"))
     {
         if let Ok(rows) = stmt.query_map(rusqlite::params![t7, device], |r| {
             Ok((

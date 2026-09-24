@@ -1,6 +1,6 @@
 # devin-usage
 
-Devin / Cursor / Antigravity / ZCode / Grok / Claude Code 的本地用量统计 +
+Devin / Cursor / Antigravity / ZCode / Grok / Claude Code / Codex 的本地用量统计 +
 系统托盘工具，跨设备汇总。
 
 逆向自各应用的真实数据面：**配额余额、云端 ACU、每个会话的真实
@@ -30,13 +30,16 @@ Windows + macOS + Linux（含无头 VPS）。
 - `devin-usage-tray`：Rust 单二进制——托盘图标（60s 刷新配额、图标随配额变色）
   + 内置 15min 自动采集 + `--panel` 可视化面板 + `collect/export/import/sync` 子命令
 - **多应用覆盖**：Devin App/CLI/Cloud + Cursor + Antigravity + ZCode + Grok +
-  Claude Code；面板顶部 Tab 完全隔离（各应用套餐/配额/计费独立），另有"总览"Tab
+  Claude Code + Codex(CLI/桌面)；面板顶部 Tab 完全隔离（各应用套餐/配额/计费独立），另有"总览"Tab
 - **多设备汇总**：每行数据打 `device` 标签（hostname），SSH 双向同步到 VPS 中心库；
   面板设备选择器 `全部 / Win / Mac / VPS` 切换，离线也能看所有设备
 - 数据存自己的 `data/usage.db`，对各应用的库**只读不写**；token 运行时现读，
   重新登录自动生效；采集幂等可反复跑
 
 ## 数据源（逆向结果）
+
+每个应用的数据位置、字段口径、token 语义坑和失准排查方法详见
+[COLLECTORS.md](COLLECTORS.md)。下面是速览。
 
 ### Devin
 
@@ -101,6 +104,15 @@ ZCode 无公开配额接口，面板显示"无配额口径"。
 
 Claude 的 `input_tokens` 本身不含缓存（与 grok 相反），无需扣除。
 注意：Claude Code 会清理旧 transcript，本地只保留近期会话的 token 明细。
+
+### Codex（Codex CLI + Codex 桌面 App，同一数据目录）
+
+|| 源 | 位置 | 采到什么 |
+|---|---|---|---|
+|| 会话转录 | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` + `archived_sessions/`（增量偏移读） | `token_usage_record` per-response token（input/cached/cache_write/output/reasoning）、`turn_context` 每轮真实模型、`session_meta` 路由方（model_provider） |
+|| 配额 | `event_msg/token_count` 里的 `rate_limits{primary,secondary}` | ChatGPT 双窗口限额（**走反代时为 null**，仅直连账号有） |
+
+Codex 的 `input_tokens` 含 cached+cache_write（OpenAI 惯例），已扣除。
 
 解码方法参考开源实现 [openusage#1139](https://github.com/robinebers/openusage/pull/1139)。
 `.pb` 旧格式/加密文件跳过。

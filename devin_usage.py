@@ -1439,6 +1439,110 @@ def collect_claude(c) -> int:
     return n_sess
 
 
+def collect_codex(c) -> int:
+    """~/.codex/sessions/**/rollout-*.jsonl + archived_sessions/ → usage_events。
+    Codex CLI 与桌面 App 写同一目录。token_usage_record 按响应计；
+    input_tokens 含 cached+cache_write（OpenAI 惯例）需扣除；
+    turn_context 提供 turn→model；event_msg/token_count 带 rate_limits
+    （ChatGPT 直连才有，走代理为 null）。"""
+    root = Path.home() / ".codex"
+    files = sorted((root / "sessions").glob("**/*.jsonl")) + \
+        sorted((root / "archived_sessions").glob("*.jsonl"))
+    if not files:
+        log_run(c, "codex", "skip", "~/.codex/sessions 不存在")
+        return 0
+    n_ev = 0
+    sess = {}
+    turn_model = {}                                # turn_id → model
+    for fp in files:
+        try:
+            for e in _read_jsonl_incremental(c, "codex", fp):
+                ts = _iso_ts(e.get("timestamp")) or 0
+                pay = e.get("payload") or {}
+                t = e.get("type")
+                if t == "session_meta":
+                    sid = pay.get("session_id") or pay.get("id") or fp.stem
+                    s = sess.setdefault(sid, {"model": "?", "n": 0, "t0": ts,
+                                              "t1": ts, "cwd": "",
+                                              "provider": "codex",
+                                              "ti": 0, "to": 0, "tcr": 0, "tcw": 0})
+                    s["cwd"] = pay.get("cwd") or s["cwd"]
+                    s["provider"] = pay.get("model_provider") or s["provider"]
+                    s["t0"] = min(s["t0"], ts)
+                elif t == "turn_context":
+                    if pay.get("turn_id") and pay.get("model"):
+                        turn_model[pay["turn_id"]] = pay["model"]
+                elif t == "token_usage_record":
+                    rid = pay.get("response_id")
+                    if not rid:
+                        continue
+                    sid = pay.get("session_id") or pay.get("thread_id") or fp.stem
+                    tid = pay.get("turn_id") or ""
+                    model = turn_model.get(tid, "?")
+                    u = pay.get("usage") or {}
+                    inp = u.get("input_tokens") or 0
+                    cr = u.get("cached_input_tokens") or 0
+                    cw = u.get("cache_write_input_tokens") or 0
+                    i_ = max(0, inp - cr - cw)
+                    o_ = u.get("output_tokens") or 0
+                    provider = sess.get(sid, {}).get("provider", "codex")
+                    day = (datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                           if ts else "1970-01-01")
+                    cur = c.execute("""INSERT OR IGNORE INTO usage_events
+                        (app,event_key,ts,day,model,kind,session_id,
+                         tok_in,tok_out,tok_cache_read,tok_cache_write,cost_usd,meta)
+                        VALUES('codex',?,?,?,?,?,?,?,?,?,?,NULL,?)""",
+                        (f"codex:{rid}", ts, day, model, provider,
+                         f"codex:{sid}", i_, o_, cr, cw,
+                         json.dumps({"reasoning": u.get("reasoning_output_tokens"),
+                                     "turn": tid, "provider": provider})))
+                    n_ev += cur.rowcount
+                    s = sess.setdefault(sid, {"model": "?", "n": 0, "t0": ts,
+                                              "t1": ts, "cwd": "",
+                                              "provider": "codex",
+                                              "ti": 0, "to": 0, "tcr": 0, "tcw": 0})
+                    s["n"] += 1
+                    s["model"] = model if model != "?" else s["model"]
+                    s["t0"] = min(s["t0"], ts); s["t1"] = max(s["t1"], ts)
+                    s["ti"] += i_; s["to"] += o_; s["tcr"] += cr; s["tcw"] += cw
+                elif t == "event_msg" and pay.get("type") == "token_count":
+                    rl = pay.get("rate_limits") or {}
+                    for lk in ("primary", "secondary"):
+                        w = rl.get(lk) or {}
+                        pct = w.get("used_percent")
+                        reset = w.get("resets_at") or w.get("reset_at")
+                        if pct is None or reset is None:
+                            continue
+                        c.execute(
+                            "INSERT OR REPLACE INTO app_quota VALUES('codex',?,?,?,?,?,?,?,?)",
+                            (lk, ts, max(0.0, 100.0 - pct), pct, 100.0, reset,
+                             json.dumps({"window_minutes": w.get("window_minutes"),
+                                         "limit_id": rl.get("limit_id")}),
+                             device()))
+        except Exception:
+            continue
+    now = int(time.time())
+    n_sess = 0
+    for sid, s in sess.items():
+        title = Path(s["cwd"]).name if s["cwd"] else sid
+        c.execute("""INSERT INTO local_sessions
+            (session_id,source,model,title,cwd,created_at,last_activity_at,
+             n_user,n_assistant,n_tool,n_system,n_tool_calls,n_prompts,
+             tok_in,tok_out,tok_cache_read,tok_cache_write,first_seen,last_seen)
+            VALUES (?, 'codex', ?, ?, ?, ?, ?, 0, ?, 0,0,0,0, ?,?,?,?, ?,?)
+            ON CONFLICT(session_id) DO UPDATE SET
+             model=excluded.model, last_activity_at=excluded.last_activity_at,
+             n_assistant=excluded.n_assistant, tok_in=excluded.tok_in,
+             tok_out=excluded.tok_out, tok_cache_read=excluded.tok_cache_read,
+             tok_cache_write=excluded.tok_cache_write, last_seen=excluded.last_seen""",
+            (f"codex:{sid}", s["model"], title, s["cwd"],
+             s["t0"], s["t1"], s["n"],
+             s["ti"], s["to"], s["tcr"], s["tcw"], now, now))
+        n_sess += 1
+    log_run(c, "codex", "ok", f"{n_sess} sessions, +{n_ev} events")
+    return n_sess
+
+
 # 等效价格表（每 1M token 美元，prefix 首个命中者胜；"" 为兜底）
 # 公开 API 刊例价；swe-2 无公开价，默认按 Sonnet 档折算。
 # 可在 data/prices.json 覆盖/新增：{"rules":[["prefix",in,out,cr,cw],...]}
@@ -1526,7 +1630,8 @@ def cmd_collect(args):
                      ("antigravity", lambda: collect_antigravity(c)),
                      ("zcode", lambda: collect_zcode(c)),
                      ("grok", lambda: collect_grok(c)),
-                     ("claude", lambda: collect_claude(c))):
+                     ("claude", lambda: collect_claude(c)),
+                     ("codex", lambda: collect_codex(c))):
         if args.only and name != args.only:
             continue
         if name in ("quota", "cloud") and not token:
@@ -1615,7 +1720,7 @@ def cmd_report(args):
                       sum(last_activity_at - created_at), sum(credit_cost), sum(acu_cost),
                       sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
                       FROM local_sessions WHERE created_at>=?
-                      AND source NOT IN ('cursor','antigravity','zcode','grok')
+                      AND source NOT IN ('cursor','antigravity','zcode','grok','claude','codex')
                       GROUP BY source, model
                       ORDER BY 3 DESC""", (since,)).fetchall()
     out["local_by_model"] = [
@@ -1631,7 +1736,7 @@ def cmd_report(args):
                        sum(tok_in), sum(tok_out), sum(tok_cache_read), sum(tok_cache_write)
                        FROM local_sessions
                        WHERE created_at>=?
-                       AND source NOT IN ('cursor','antigravity','zcode','grok')""",
+                       AND source NOT IN ('cursor','antigravity','zcode','grok','claude','codex')""",
                        (since,)).fetchone()
     out["local_totals"] = {"sessions": tot[0] or 0, "user_msgs": tot[1] or 0,
                            "tool_calls": tot[2] or 0,
